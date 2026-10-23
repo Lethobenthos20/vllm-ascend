@@ -155,6 +155,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+from vllm_ascend.core.qwen4_exp_pp import is_qwen4_exp_model_config
 from vllm_ascend.core.six_region_kv_cache_layout import (
     GDN,
     HIDDEN,
@@ -216,7 +217,6 @@ from vllm_ascend.spec_decode.interfaces import (
     SupportsPerGroupBlockTables,
     SupportsPerGroupKernelBlockSizes,
 )
-from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
 from vllm_ascend.spec_decode.qwen4_exp import AscendQwen4ExpMTPProposer
@@ -291,6 +291,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
     from vllm_ascend.models.deepseek_v41.decoder_replay_layers import AscendDecoderReplayLayers
+    from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
@@ -701,7 +702,11 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.qwen4_exp_input_adapter = None
         text_config = getattr(self.model_config, "hf_text_config", None)
-        if text_config is not None and getattr(text_config, "ple_layer_ids", None):
+        if (
+            text_config is not None
+            and getattr(text_config, "ple_layer_ids", None)
+            and (not is_qwen4_exp_model_config(self.model_config) or get_pp_group().is_first_rank)
+        ):
             # Keep the Qwen4Exp package out of unrelated model startup paths.
             from vllm_ascend.models.qwen4_exp.input_adapter import (
                 build_qwen4_exp_input_adapter,
@@ -1056,7 +1061,88 @@ class NPUModelRunner(GPUModelRunner):
             device=self.device,
         ).unsqueeze(1)
 
+    def _get_pp_accepted_token_counts(self, scheduler_output: "SchedulerOutput") -> dict[str, int]:
+        """Recover last step's accepted counts on non-sampling PP stages.
+
+        Only the final stage runs the sampler/state postprocess. The scheduler
+        returns the authoritative output length to every stage; compare it
+        with the previous local length before the parent updates that state.
+        ``new_token_ids`` contains the next input, not every accepted token.
+        """
+        pp = get_pp_group()
+        if (
+            self.use_async_scheduling
+            or pp.world_size == 1
+            or pp.is_last_rank
+            or self.speculative_config is None
+            or not self.model_config.is_hybrid
+        ):
+            return {}
+        data = scheduler_output.scheduled_cached_reqs
+        counts = {}
+        for index, req_id in enumerate(data.req_ids):
+            state = self.requests.get(req_id)
+            if state is None or req_id in data.resumed_req_ids:
+                continue
+            count = data.num_output_tokens[index] - len(state.output_token_ids)
+            if count > 0:
+                counts[req_id] = count
+        return counts
+
+    def _restore_pp_accepted_draft_tokens(self, counts: dict[str, int]) -> None:
+        """Commit accepted draft prefixes before appending the sampled input.
+
+        The next scheduler payload contains only the final (bonus/correction)
+        token. Accepted draft IDs are still in the previous persistent batch;
+        without committing them, the parent broadcasts that final token over
+        their CPU-cache positions and loses the request's token history.
+        """
+        for req_id, count in counts.items():
+            num_drafts = count - 1
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if num_drafts <= 0 or req_index is None:
+                continue
+            drafts = self.input_batch.spec_token_ids[req_index]
+            assert num_drafts <= len(drafts), "PP acceptance exceeds the previous batch's drafts"
+            self.requests[req_id].output_token_ids.extend(drafts[:num_drafts])
+            self.input_batch.num_tokens_no_spec[req_index] += num_drafts
+
+    def _preserve_pp_mtp_idle_batch(self, scheduler_output: "SchedulerOutput") -> "SchedulerOutput":
+        """Do not evict in-flight speculative state for an empty PP bubble.
+
+        These zero-valued keys are used only by the parent's row-lifecycle
+        update. The outer execute_model still sees the original empty output,
+        and no model tokens are added. Finish/preemption cleanup stays active.
+        """
+        if (
+            scheduler_output.total_num_scheduled_tokens != 0
+            or self.use_async_scheduling
+            or self.speculative_config is None
+            or not self.model_config.is_hybrid
+            or get_pp_group().world_size == 1
+        ):
+            return scheduler_output
+        removed = (
+            scheduler_output.finished_req_ids
+            | (scheduler_output.preempted_req_ids or set())
+            | scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        )
+        retained = {req_id: 0 for req_id in self.input_batch.req_id_to_index if req_id not in removed}
+        if not retained:
+            return scheduler_output
+        return replace(scheduler_output, num_scheduled_tokens=retained)
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
+        # Keep this compatibility path exclusive to Qwen3.8 Flash Next.
+        use_qwen_pp_mtp = (
+            is_qwen4_exp_model_config(self.model_config)
+            and self.speculative_config is not None
+            and not self.use_async_scheduling
+            and get_pp_group().world_size > 1
+        )
+        pp_accepted_counts = self._get_pp_accepted_token_counts(scheduler_output) if use_qwen_pp_mtp else {}
+        if use_qwen_pp_mtp:
+            self._restore_pp_accepted_draft_tokens(pp_accepted_counts)
         self._update_replay_requests(scheduler_output)
         # Temporary rewind guard for KV-load-failure recompute.
         # This can be removed after the upstream fix is merged.
@@ -1091,7 +1177,13 @@ class NPUModelRunner(GPUModelRunner):
                 new_block_ids_to_zero=[],
                 kv_cache_block_copies=[],
             )
-        sampling_metadata = super()._update_states(scheduler_output)
+        lifecycle_output = self._preserve_pp_mtp_idle_batch(scheduler_output) if use_qwen_pp_mtp else scheduler_output
+        sampling_metadata = super()._update_states(lifecycle_output)
+        # The parent may condense or reorder InputBatch; restore by request ID.
+        for req_id, count in pp_accepted_counts.items():
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is not None:
+                self.input_batch.num_accepted_tokens_cpu[req_index] = count
         self._track_tmp_encoder_cache_refs(scheduler_output)
         return sampling_metadata
 
@@ -2140,7 +2232,7 @@ class NPUModelRunner(GPUModelRunner):
                 self._num_valid_draft_tokens,
                 batch_size,
             )
-        elif isinstance(self.drafter, AscendMedusaProposer):
+        elif self.speculative_config is not None and self.speculative_config.method == "medusa":
             draft_token_ids = self.drafter.propose(
                 # Dynamic SD: forward the scheduled K (equals the configured
                 # maximum when the feature is disabled).
@@ -2377,6 +2469,18 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 self.draft_token_ids_cpu[:num_reqs, :num_spec_tokens] = 0
             self.draft_token_ids_event.record()
+
+    def _attach_pp_draft_tokens(self, output: ModelRunnerOutput) -> None:
+        """Carry this batch's drafts with its PP output, aligned by request ID.
+
+        The PP EngineCore adapter consumes these alongside sampled tokens;
+        fetching global latest drafts later can refer to a different batch.
+        """
+        drafts = self.take_draft_token_ids()
+        if drafts is None:
+            return
+        by_request = dict(zip(drafts.req_ids, drafts.draft_token_ids))
+        output.spec_token_ids = [by_request.get(req_id, []) for req_id in output.req_ids]
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         out = super().take_draft_token_ids()
@@ -3114,6 +3218,8 @@ class NPUModelRunner(GPUModelRunner):
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         if not self.use_async_scheduling:
+            if use_pp_spec_decode and is_qwen4_exp_model_config(self.model_config):
+                self._attach_pp_draft_tokens(model_runner_output)
             return model_runner_output
 
         # R3 is served by the V2 runner through vLLM's AuxOutput connector.
@@ -4264,7 +4370,13 @@ class NPUModelRunner(GPUModelRunner):
             # But gdn needs an unpadded one.
             # gdn_query_start_loc is an unpadded version of query_start_loc.
             # TODO delete it if fia's check is removed.
-            if self._has_gdn:
+            # PP retains global cache group IDs even when a group has no local
+            # layers (for example, PLE cache on a later pipeline stage).
+            # Keep its block-table/drafter bookkeeping, but do not index an
+            # absent local attention group to choose GDN metadata.
+            if self._has_gdn and (
+                not is_qwen4_exp_model_config(self.model_config) or self.attn_groups[kv_cache_gid]
+            ):
                 attn_group = self.attn_groups[kv_cache_gid][0]
                 builder = attn_group.get_metadata_builder(0)
                 if isinstance(builder, GDNAttentionMetadataBuilder):
@@ -5033,6 +5145,29 @@ class NPUModelRunner(GPUModelRunner):
             self._debugger_started = False
 
         self.debugger.step(**kwargs)
+
+    def initialize_metadata_builders(
+        self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
+    ) -> None:
+        """Build target metadata; initialize the Ascend drafter after KV binding.
+
+        The upstream helper also initializes CUDA-specific proposer classes.
+        Ascend handles its proposer below in initialize_kv_cache, including
+        PP stages without a local drafter and per-group kernel block sizes.
+        """
+        if not is_qwen4_exp_model_config(self.model_config):
+            return super().initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+        for group_id in range(len(kv_cache_config.kv_cache_groups)):
+            for attn_group in self.attn_groups[group_id]:
+                attn_group.create_metadata_builders(
+                    self.vllm_config,
+                    self.device,
+                    kernel_block_sizes[group_id] if group_id < len(kernel_block_sizes) else None,
+                    num_metadata_builders=(
+                        self.parallel_config.num_ubatches if self.parallel_config.use_ubatching else 1
+                    ),
+                )
+        self.calculate_reorder_batch_threshold()
 
     def initialize_kv_cache(
         self,
@@ -7380,6 +7515,13 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in attn_layer_names:
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
+
+        # New Core planning reads explicit draft ownership instead of inferring
+        # it from layer names. Preserve that flag in the Ascend V1 spec path.
+        if is_qwen4_exp_model_config(self.model_config) and "is_draft" in KVCacheSpec.__dataclass_fields__:
+            for layer_name, spec in kv_cache_spec.items():
+                if getattr(attn_layers[layer_name], "is_draft_layer", False):
+                    kv_cache_spec[layer_name] = replace(spec, is_draft=True)
 
         if self.sparse_kv_offload_enabled:
             self.kv_cache_spec = kv_cache_spec # reserve for Sparse KV offload usage

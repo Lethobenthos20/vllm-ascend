@@ -350,6 +350,12 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 mamba_specs[layer_name] = replace(spec, page_size_padded=common_page_size)
         kv_cache_spec.update(mamba_specs)
 
+    from vllm_ascend.core.qwen4_exp_pp import is_qwen4_exp_model_config
+
+    if is_qwen4_exp_model_config(vllm_config.model_config) and "is_draft" in KVCacheSpec.__dataclass_fields__:
+        for layer_name, spec in kv_cache_spec.items():
+            if getattr(attn_layers[layer_name], "is_draft_layer", False):
+                kv_cache_spec[layer_name] = replace(spec, is_draft=True)
     return kv_cache_spec
 
 
@@ -1462,6 +1468,31 @@ def allocate_kv_cache_main(
         for layer_name, layer in attn_layers.items()
         if (target_layer := getattr(layer, "kv_sharing_target_layer_name", None))
     }
+
+    from vllm_ascend.core.six_region_kv_cache_layout import (
+        HIDDEN,
+        allocate_six_region_kv_cache,
+        build_six_region_kv_cache_layout,
+    )
+
+    six_region = build_six_region_kv_cache_layout(kv_cache_config.kv_cache_groups, kv_cache_config.num_blocks)
+    if six_region is not None:
+        if vllm_config.kv_transfer_config is not None:
+            raise NotImplementedError("Qwen4Exp V2 six-region KV transfer requires a connector-specific layout")
+        hidden_shapes = {
+            owner.layer_name: (
+                kv_cache_config.num_blocks,
+                owner.spec.num_heads,
+                owner.spec.num_states,
+                owner.spec.state_content_size_bytes // get_dtype_size(owner.spec.dtype),
+            )
+            for owner in six_region.owners
+            if owner.role == HIDDEN
+        }
+        caches = allocate_six_region_kv_cache(six_region, device, hidden_shapes)
+        for layer_name, target_layer in shared_layers.items():
+            caches[layer_name] = caches[target_layer]
+        return caches
 
     raw_tensors = _allocate_kv_cache(
         kv_cache_config,

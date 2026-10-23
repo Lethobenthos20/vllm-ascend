@@ -1,0 +1,144 @@
+Qwen3.8-Flash-Next PP integration handoff (WIP)
+
+Scope and versions
+------------------
+Base branch: feat/qwen38-flash-next-main-v1
+Base revision: adc05909ea0125d058c2c9eb3131e761929f2551
+Reference vLLM: 876d5da8316a81180b8c7f10dea5ffab5b5a849f (unmodified)
+Model: Qwen3.8-Flash-Next-w8a8 (unmodified checkpoint)
+Reference device environment: Ascend 9382/aarch64, driver 26.1.0.b087,
+CANN 9.2. Rebuild native extensions for the actual test host/environment.
+This target branch includes updates beyond the reference experiment baseline;
+check dependencies and rerun tests on the exact merged SHA.
+
+What this branch adds
+---------------------
+PP foundation: PLE first-stage ownership checks and input preparation, empty
+local attention groups, six-region cache planning/allocation and V2 model state.
+Pinned-version compatibility: KV planning/builder imports, GDN parameter API
+and lazy Medusa imports. No other model implementation or 310P/TurboQuant
+caller changes are included. The Qwen-specific builder, draft markers,
+metadata initialization and GDN replacement path are gated by Qwen4Exp
+model configuration; non-Qwen models retain their original branch.
+MTP: target/draft cache ownership, metadata builder initialization, per-batch
+draft token transport aligned with request IDs, accepted-draft history and GDN
+accepted-count feedback on non-sampling PP stages, and persistent speculative
+state across zero-token PP bubbles. The new runner path is Qwen4Exp-only;
+non-Qwen models keep the original update and batch-lifecycle path.
+The base already provides the Qwen MTP model, proposer, PP engine patch and
+FlashComm1 implementation. This branch adds no dedicated FlashComm1 kernel.
+Graph replay is outside this eager validation scope.
+
+Known results and unresolved issues
+----------------------------------
+Previous r9 V1 MTP TP4/PP2 experiment: 83 draft tokens, 10 accepted, but all
+three short request outputs were abnormal. This is NOT a correctness pass.
+The subsequent local r11 reference experiment repaired accepted-draft history,
+GDN accepted counts and PP idle-row eviction. On host 80.5.17.120, physical NPUs 0-7,
+V1 TP4/PP2 eager TEXTONLY MTP1 completed three serial requests of 32 tokens with
+49 draft/44 accepted tokens and 3/3 exact text matches to the freshly rerun
+MTP-off control. A second PP2 run without debug hooks and a PP1/MTP regression
+also matched 3/3. Related reference CPU regressions: 56 passed.
+Those experiments used the cb36177d-based local adaptation plus reference
+vLLM 876d5da; they are provenance for this fix, not a device certification of
+this fork's newer base or its final pushed SHA. Rerun the matrix below on the
+exact source branch SHA with matching dependencies/native extensions.
+Previous V2 MTP initialization: Unsupported attention backend AscendQSABackend.
+Previous CPU regression: 45 passed in the reference Linux experiment only;
+this does not certify this branch, native execution, or MTP correctness.
+FlashComm1 Prefill + PP has no completed active-path correctness comparison.
+
+Source-branch checks for this update: 15 dependency-isolated regression cases
+passed using actual runner method bodies extracted from source, including four
+non-Qwen fallbacks. These are not full module-import tests. 16 scope checks
+passed and eight other-model/310P/TurboQuant files equal the target base.
+The full project CPU suite was attempted with reference vLLM 876d5da but blocked
+before collection by pre-existing non-Qwen dependency imports (DeepseekV4Config
+legacy module path; may_override_num_blocks API). No other-model production
+source was changed to bypass those failures. Use matching dependencies and run
+the full suite below; exact-branch NPU accuracy and performance remain pending.
+
+CPU regression entry points (inside a compatible vLLM/Ascend environment)
+-----------------------------------------------------------------------
+python -m pytest -q \
+  tests/ut/core/test_qwen4_exp_pp.py \
+  tests/ut/core/test_six_region_kv_cache_layout.py \
+  tests/ut/models/qwen4_exp/test_pp_model_state.py \
+  tests/ut/patch/platform/test_qwen4_exp_pp_config.py \
+  tests/ut/patch/platform/test_packed_kv_cache_compat.py \
+  tests/ut/patch/platform/test_patch_pp_mtp.py \
+  tests/ut/worker/test_pp_empty_attn_groups.py \
+  tests/ut/worker/test_pp_target_metadata_builders.py \
+  tests/ut/worker/test_pp_draft_output_transport.py \
+  tests/ut/worker/test_pp_accepted_token_counts.py \
+  tests/ut/spec_decode/test_qwen4_exp_cache_groups.py \
+  tests/ut/spec_decode/test_qwen4_exp_proposer_dispatch.py
+Run tests/ut/worker/test_attn_utils_v2.py as well for V2 changes.
+
+MTP device validation
+---------------------
+1. Use only allocated, genuinely free cards. Verify process rows and HBM before
+   launch; isolate code, container, selected devices, caches and ports.
+2. Establish MTP off/on with PP=1 first, then PP=2. Keep the same weights,
+   prompts, sampling parameters and workload. Record TP changes separately.
+3. Start with V1, eager, synchronous scheduling and text-only requests.
+   Control: --enforce-eager --no-async-scheduling
+   --limit-mm-per-prompt '{"image":0,"video":0}'
+   MTP adds: --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+   Select the runner with VLLM_USE_V2_MODEL_RUNNER=0 or 1.
+4. Save raw requests/responses and token IDs, draft/accepted metrics, per-worker
+   logs, exit codes, layer partitions, effective configuration and model/source
+   hashes. Exercise repeated requests and continuous Decode.
+5. A successful startup or zero generated drafts is not a pass. Require actual
+   speculation and output correctness against the control. Investigate TP-only
+   effects before attributing differences to PP. Do not bypass the V2 QSA backend
+   contract by relabeling it as another attention backend.
+
+FlashComm1 Prefill device validation
+-----------------------------------
+Disable MTP to isolate the feature. Confirm the compatible communication
+backend, expert parallelism and TP>1. The existing Ascend parallel-config
+patch also permits DP=1. Inspect the effective configuration
+and execution evidence that sequence-parallel MoE/FlashComm1 actually runs.
+TP4/PP2/DP1 with EP uses eight cards and is a candidate topology; verify the
+effective SP switch and actual model communication, rather than relying only
+on the flag. PLE ownership, capacity and partition must be checked before
+launch. No final FlashComm1+PP configuration is certified.
+Once feasible, compare FlashComm1 off/on under the same parallel configuration,
+with max_tokens=1 to scope the check to Prefill/first-token generation. Retain
+first-token output, appropriate logits comparisons and actual communication
+execution evidence. A flag that is silently disabled is not feature coverage.
+
+Acceptance and reporting
+------------------------
+Report V1 and V2 independently as passed, unsupported with a concrete reason,
+failed, or unverified. Startup, CPU-only tests and process exit are insufficient.
+Do not claim full model accuracy or performance from short smoke requests.
+Record the tested commit and environment so the receiver can reproduce results.
+This Draft branch includes the reference V1 MTP+PP correctness repair and
+prepares exact-SHA regression testing. V2 QSA initialization, full accuracy,
+performance, async/prefix combinations and FlashComm1 Prefill+PP remain outside
+the reference smoke-pass conclusion.
+
+Startup compatibility follow-up
+-------------------------------
+The shared startup imports used by Qwen still refer to two helpers in the old
+upstream kv_cache_utils module. The shared runner also imports a removed
+configuration module. The adapter maps that old path to the real Transformers
+configuration module used by the reference upstream (not a fake configuration
+class). The Ascend planning adapter re-exports the
+actual moved helpers only when those legacy names are absent; it does not
+change cache algorithms, edit the upstream checkout, or edit other model
+implementation files. This import compatibility is process-wide because it
+runs before CLI model configuration exists. It is not a per-model behavior
+change or evidence that another model has been tested.
+The original may_override_num_blocks ImportError is reproduced on be8cf08;
+with this fix the actual serve --help plugin/argument-parser path exits zero
+in the same reference environment. The actual Qwen model class and V1
+NPUModelRunner also import successfully in an isolated container exposing
+physical NPUs 0-7 on host120. Six dependency-isolated import compatibility
+cases and 11 Qwen MTP state regressions pass; non-Qwen cases are excluded.
+These are import/state checks, not model-loading or inference passes. Full
+project CPU collection and all-file CI were not completed for this follow-up;
+only scoped checks ran. Exact revision NPU inference remains a separate
+acceptance requirement.

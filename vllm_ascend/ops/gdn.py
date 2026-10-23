@@ -41,6 +41,7 @@ from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
 )
+from vllm_ascend.core.qwen4_exp_pp import is_qwen4_exp_model_config
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
@@ -75,7 +76,7 @@ def _get_base_conv1d(layer: nn.Module) -> nn.Module:
 
 
 @torch.no_grad()
-def _pack_conv_weights(conv1d: nn.Module) -> None:
+def _pack_conv_weights(conv1d: nn.Module, *, qwen4_exp: bool = False) -> None:
     """Pack ``[D, 1, W]`` weights into the kernel's ``[W, D]`` layout."""
     source_weight = conv1d.weight
     if source_weight.is_meta:
@@ -92,7 +93,7 @@ def _pack_conv_weights(conv1d: nn.Module) -> None:
         conv1d,
         _PACKED_CONV_WEIGHT_NAME,
         packed_weight,
-        prefer_copy=True,
+        **({} if qwen4_exp else {"prefer_copy": True}),
     )
 
 
@@ -124,7 +125,7 @@ def initialize_packed_conv_weight(layer: nn.Module) -> None:
     @wraps(process_weights_after_loading)
     def process_weights_and_pack(*args, **kwargs):
         result = process_weights_after_loading(*args, **kwargs)
-        _pack_conv_weights(conv1d)
+        _pack_conv_weights(conv1d, qwen4_exp=is_qwen4_exp_model_config(layer.model_config))
         return result
 
     quant_method.process_weights_after_loading = process_weights_and_pack
@@ -221,7 +222,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     @torch.no_grad()
     def _pack_conv_weights(self) -> None:
         """Refresh the kernel-layout convolution parameter in place."""
-        _pack_conv_weights(_get_base_conv1d(self))
+        _pack_conv_weights(_get_base_conv1d(self), qwen4_exp=is_qwen4_exp_model_config(self.model_config))
 
     # Cached fused-op availability probe result, shared across all layers so the
     # smoke call runs at most once per process.

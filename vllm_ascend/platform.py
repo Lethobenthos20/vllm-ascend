@@ -308,6 +308,14 @@ class NPUPlatform(Platform):
         _CUSTOM_OP_REGISTERED = True
 
     @classmethod
+    def get_kv_cache_config_builder_cls(cls, vllm_config) -> str:
+        from vllm_ascend.core.qwen4_exp_pp import is_qwen4_exp_model_config
+
+        if not is_qwen4_exp_model_config(vllm_config.model_config):
+            return super().get_kv_cache_config_builder_cls(vllm_config)
+        return "vllm_ascend.core.kv_cache_config_builder.AscendKVCacheConfigBuilder"
+
+    @classmethod
     def pre_register_and_update(cls, parser: FlexibleArgumentParser | None = None) -> None:
         # Adapt the global patch here.
         from vllm_ascend.utils import adapt_patch

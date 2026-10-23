@@ -1,0 +1,15 @@
+pr: 3
+entries:
+  - category: bugfix
+    text: >-
+      Restore Qwen3.8-Flash-Next synchronous PP speculative state across empty
+      pipeline batches, commit accepted draft-token history on non-sampling
+      stages, and propagate accepted counts before preparing GDN metadata.
+      Other model update paths remain unchanged. Exact-revision device
+      regression and FlashComm1 Prefill activation validation remain pending.
+  - category: bugfix
+    text: >-
+      Fix Qwen3.8-Flash-Next plugin startup on the split upstream KV planning
+      API by retaining missing legacy import names for the original helpers,
+      and resolve the shared runner's removed configuration import using the
+      real upstream provider, without editing other model implementation files.

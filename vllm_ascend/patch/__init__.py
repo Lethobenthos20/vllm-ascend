@@ -25,6 +25,32 @@
 #
 # Once a new patch is added in vllm-ascend, please add the patch description into this file as well.
 # ----------------------------------------------------------------------------------
+#
+# platform/patch_qwen4_exp_pp.py:
+#   Replace Qwen4Exp's unconditional PLE PP rejection with an Ascend-specific
+#   first-stage ownership check, preserving all other upstream restrictions.
+#   V1 prepares PLE inputs only on that stage; V2 uses AscendQwen4ExpModelState.
+#   No upstream source/checkpoint is modified. Remove this verifier patch when
+#   upstream provides a platform hook for the PLE pipeline ownership contract.
+#
+# core/kv_cache_planning.py (Qwen startup import compatibility):
+#   Shared startup imports still request may_override_num_blocks and
+#   create_kv_cache_group_specs from the pre-split upstream module. Export
+#   the actual upstream functions under missing legacy names before those
+#   imports run. Never overwrite an existing export or change its algorithm.
+#   Also retain a removed configuration import path by referencing the real
+#   Transformers configuration module now used by upstream, never a stub.
+#   No other model implementation is edited. These aliases are process-wide
+#   because plugin initialization precedes model configuration. Remove when
+#   shared imports use the current providers directly or become model-lazy.
+#
+# platform/patch_kv_cache_utils.py (current Core planning API):
+#   Planning helpers moved to kv_cache_planning and Core now owns PP projection
+#   and block convergence. AscendKVCacheConfigBuilder supplies six-region
+#   placement for exactly the Core-selected block count. Draft ownership comes
+#   from KVCacheSpec.is_draft. Keep legacy helper patches only on the legacy
+#   module; remove the remaining grouping hooks when the upstream builder can
+#   express Ascend's QSA composite and GDN grouping without module overrides.
 
 # What's Patched and how it works:
 # --------------------------------

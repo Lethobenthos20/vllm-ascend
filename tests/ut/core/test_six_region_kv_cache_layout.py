@@ -295,6 +295,66 @@ def test_main_planner_uses_one_shared_backing_geometry() -> None:
     assert hidden_tensor.size == 98304
 
 
+def test_pp_later_stage_has_empty_ple_region_and_exact_core_block_count() -> None:
+    from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+
+    groups = [group for group in _groups() if "model.ple" not in group.layer_names]
+    layout = build_six_region_kv_cache_layout(groups, num_blocks=7)
+    assert layout is not None
+    assert layout.region("r6").size == 0
+    assert not any(owner.role == PLE for owner in layout.owners)
+    config = AscendKVCacheConfigBuilder().get_kv_cache_config_from_groups(
+        SimpleNamespace(cache_config=SimpleNamespace(prefix_cache_retention_interval=None)), groups, 7
+    )
+    assert config.num_blocks == 7
+    assert {name for tensor in config.kv_cache_tensors for name in tensor.layers} == {
+        name for group in groups for name in group.layer_names
+    }
+    assert all(tensor.offset + tensor.block_stride * 7 <= tensor.size for tensor in config.kv_cache_tensors)
+
+
+@pytest.mark.parametrize("with_draft", [False, True])
+def test_core_planning_projects_pp_groups_and_converges_blocks(with_draft) -> None:
+    from dataclasses import replace
+
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_configs
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=2048, original_max_model_len=2048, supports_kv_cache_grouping=False),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        attention_config=SimpleNamespace(hisparse_config=None),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1, tensor_parallel_size=4),
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="align",
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC,
+        ),
+        speculative_config=SimpleNamespace(use_eagle_block_drop=lambda: True) if with_draft else None,
+        max_in_flight_tokens=4096,
+        num_prefill_lookahead_tokens=1,
+    )
+    specs = _ungrouped_qwen_specs()
+    if with_draft:
+        specs = {name: replace(spec, is_draft=".layers.51." in name) for name, spec in specs.items()}
+    first = {name: spec for name, spec in specs.items() if name == "model.ple" or int(name.split(".")[2]) < 24}
+    last = {name: spec for name, spec in specs.items() if name not in first}
+    configs = get_kv_cache_configs(config, [first, last], [2**29, 2**30])
+    assert configs[0].num_blocks == configs[1].num_blocks > 1
+    for local_config, local_specs in zip(configs, [first, last], strict=True):
+        assert {name for group in local_config.kv_cache_groups for name in group.layer_names} == set(local_specs)
+        assert {name for tensor in local_config.kv_cache_tensors for name in tensor.layers} == set(local_specs)
+        layout = build_six_region_kv_cache_layout(local_config.kv_cache_groups, local_config.num_blocks)
+        assert layout is not None
+        if local_specs is last:
+            assert layout.region("r6").size == 0
+        if with_draft:
+            for group in local_config.kv_cache_groups:
+                if group.layer_names:
+                    assert all(local_specs[name].is_draft == group.is_eagle_group for name in group.layer_names)
+
+
 @pytest.mark.parametrize("kv_transfer_config", [None, SimpleNamespace(kv_connector="MooncakeConnectorV1")])
 def test_six_region_allocation_requires_no_kv_transfer(monkeypatch, kv_transfer_config) -> None:
     runner = NPUModelRunner.__new__(NPUModelRunner)
@@ -413,6 +473,23 @@ def test_runner_materializes_contiguous_six_region_views() -> None:
     compressed = caches["model.layers.11.self_attn.indexer.compressed_key_cache"]
     assert compressed.shape == (3, 1, 64, 32)
     assert compressed.is_contiguous()
+
+    from vllm_ascend.core.six_region_kv_cache_layout import allocate_six_region_kv_cache
+
+    v2_caches = allocate_six_region_kv_cache(
+        layout, torch.device("cpu"), {"model.cache_only_layers.0": tuple(caches["model.cache_only_layers.0"].shape)}
+    )
+    assert v2_caches.keys() == caches.keys()
+    for name, v1_cache in caches.items():
+        v1_parts = (v1_cache,) if isinstance(v1_cache, torch.Tensor) else v1_cache
+        v2_cache = v2_caches[name]
+        v2_parts = (v2_cache,) if isinstance(v2_cache, torch.Tensor) else v2_cache
+        assert len(v1_parts) == len(v2_parts)
+        for v1_part, v2_part in zip(v1_parts, v2_parts, strict=True):
+            assert v1_part.shape == v2_part.shape
+            assert v1_part.dtype == v2_part.dtype
+            assert v1_part.stride() == v2_part.stride()
+            assert v1_part.storage_offset() == v2_part.storage_offset()
 
 
 def test_qsa_source_sets_must_match() -> None:

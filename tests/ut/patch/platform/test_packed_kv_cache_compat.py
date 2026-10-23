@@ -27,7 +27,8 @@ def test_packed_groups_use_matching_eagle_annotation_api(use_fallback):
         _uses_trailing_mtp_layers=predicate,
     )
     with (
-        patch.object(cache_patch.vllm.v1.core, "kv_cache_utils", upstream),
+        patch.object(cache_patch, "planning", upstream),
+        patch.object(cache_patch, "_orig_annotate_eagle_groups", annotator),
         patch.object(cache_patch, "is_deepseek_v41_cache", return_value=True),
         patch.object(cache_patch, "group_cache_specs", return_value=specs),
         patch.object(cache_patch, "make_cache_groups", return_value=groups),
@@ -37,3 +38,14 @@ def test_packed_groups_use_matching_eagle_annotation_api(use_fallback):
     predicate.assert_called_once_with(config)
     assert annotator.call_args.args == (config, specs, groups)
     warning.assert_called_once_with(config, groups)
+
+
+def test_current_core_owns_draft_annotation():
+    groups = [object()]
+    with (
+        patch.object(cache_patch, "_orig_annotate_eagle_groups", None),
+        patch.object(cache_patch, "is_deepseek_v41_cache", return_value=True),
+        patch.object(cache_patch, "group_cache_specs", return_value={}),
+        patch.object(cache_patch, "make_cache_groups", return_value=groups),
+    ):
+        assert cache_patch._ascend_get_packed_kv_cache_groups(SimpleNamespace(), {}) is groups

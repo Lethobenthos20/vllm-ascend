@@ -186,7 +186,9 @@ def build_six_region_kv_cache_layout(
     if not role_members[QSA_RAW]:
         return None
     required = (QSA_MAIN, QSA_RAW, QSA_COMPRESSED, GDN, PLE)
-    missing = [role for role in required if not role_members[role]]
+    # PLE may belong only to the first PP stage. Preserve the six-region
+    # descriptor numbering on later stages with an empty r6 slab.
+    missing = [role for role in required if role != PLE and not role_members[role]]
     if missing or unknown:
         details = [(name, type(spec).__name__) for name, spec in unknown]
         raise ValueError(f"Six-region QSA hybrid cache layout is incomplete: missing={missing}, unsupported={details}")
@@ -274,7 +276,7 @@ def build_six_region_kv_cache_layout(
         max(v_bytes for _, v_bytes in main_pages),
         max(_real_page_size_bytes(spec) for _, spec in role_members[QSA_RAW]),
         max(_real_page_size_bytes(spec) for _, spec in role_members[QSA_COMPRESSED]),
-        max(_state_bytes(spec, 0) for spec in ple_specs),
+        max((_state_bytes(spec, 0) for spec in ple_specs), default=0),
     )
 
     max_ssm_bytes = max(_state_bytes(spec, 1) for spec in gdn_specs)
@@ -365,6 +367,53 @@ def make_contiguous_slab_view(
     result = backing[storage_offset : storage_offset + required_bytes].view(dtype).view(num_blocks, *item_shape)
     assert result.is_contiguous()
     return result
+
+
+def allocate_six_region_kv_cache(
+    layout: SixRegionKVCacheLayout,
+    device: torch.device,
+    hidden_shapes: dict[str, tuple[int, ...]],
+) -> dict[str, torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor]]:
+    """Materialize the same contiguous QSA/GDN/PLE slabs for Model Runner V2."""
+    backing = torch.zeros(layout.slot_count * layout.slot_backing_size, dtype=torch.int8, device=device)
+    caches = {}
+    for owner in layout.owners:
+        spec = owner.spec
+        if owner.role == HIDDEN:
+            caches[owner.layer_name] = torch.zeros(hidden_shapes[owner.layer_name], dtype=spec.dtype, device=device)
+            continue
+        slot_offset = owner.slot * layout.slot_backing_size
+
+        def view(region_name, dtype, shape, slot_offset=slot_offset):
+            return make_contiguous_slab_view(
+                backing,
+                dtype=dtype,
+                num_blocks=layout.num_blocks,
+                item_shape=shape,
+                storage_offset=slot_offset + layout.region(region_name).offset,
+            )
+
+        if owner.role == QSA_MAIN:
+            caches[owner.layer_name] = (
+                view("r2", spec.dtype, (spec.block_size, spec.num_kv_heads, spec.head_size)),
+                view("r3", spec.dtype, (spec.block_size, spec.num_kv_heads, spec.head_size_v)),
+            )
+        elif owner.role in (QSA_RAW, QSA_COMPRESSED):
+            region = "r4" if owner.role == QSA_RAW else "r5"
+            rows = spec.block_size if owner.role == QSA_RAW else spec.num_states
+            page_bytes = rows * spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
+            if page_bytes != layout.region(region).page_size_bytes:
+                raise ValueError(f"{owner.layer_name} six-region page mismatch")
+            caches[owner.layer_name] = view(region, spec.dtype, (spec.num_kv_heads, rows, spec.head_size))
+        elif owner.role in (GDN, PLE):
+            regions = ("r1", "r2") if owner.role == GDN else ("r6",)
+            caches[owner.layer_name] = [
+                view(region, dtype, tuple(shape))
+                for region, dtype, shape in zip(regions, spec.dtypes, spec.shapes, strict=True)
+            ]
+        else:
+            raise ValueError(f"Unsupported six-region owner: {owner}")
+    return caches
 
 
 __all__ = [

@@ -8,7 +8,6 @@ import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
-from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -28,6 +27,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_kv_cache_compression_ratio,
     is_prefix_cacheable,
 )
+from vllm_ascend.core.kv_cache_planning import _approximate_gcd, may_override_num_blocks, planning
 from vllm_ascend.core.six_region_kv_cache_layout import (
     GDN,
     HIDDEN,
@@ -59,17 +59,17 @@ from vllm_ascend.utils import vllm_version_is
 _KIMI_K3_TARGET_LAYER_PREFIX = "language_model.model.layers."
 _KIMI_K3_DRAFT_LAYER_PREFIX = "model.layers."
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
-_orig_get_kv_cache_groups_uniform_page_size = vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size
-_orig_get_kv_cache_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_groups
+_orig_get_kv_cache_groups_uniform_page_size = planning._get_kv_cache_groups_uniform_page_size
+_orig_get_kv_cache_groups = planning.get_kv_cache_groups
 if vllm_version_is("0.28.0"):
     _orig_get_packed_kv_cache_groups = None
     _orig_annotate_eagle_groups = None
 else:
-    _orig_get_packed_kv_cache_groups = vllm.v1.core.kv_cache_utils._get_packed_kv_cache_groups
-    _orig_annotate_eagle_groups = vllm.v1.core.kv_cache_utils._annotate_eagle_groups
-_orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
-_orig_max_memory_usage_bytes_from_groups = vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups
-_orig_pool_bytes_per_block = vllm.v1.core.kv_cache_utils._pool_bytes_per_block
+    _orig_get_packed_kv_cache_groups = planning._get_packed_kv_cache_groups
+    _orig_annotate_eagle_groups = getattr(planning, "_annotate_eagle_groups", None)
+_orig_get_kv_cache_config_from_groups = planning.get_kv_cache_config_from_groups
+_orig_max_memory_usage_bytes_from_groups = planning._max_memory_usage_bytes_from_groups
+_orig_pool_bytes_per_block = planning._pool_bytes_per_block
 if UniformTypeKVCacheSpecs.max_num_blocks_per_req is KVCacheSpec.max_num_blocks_per_req:
 
     def _uniform_type_max_num_blocks_per_req(
@@ -493,14 +493,17 @@ def _ascend_get_packed_kv_cache_groups(
             assert _orig_get_packed_kv_cache_groups is not None
             return _orig_get_packed_kv_cache_groups(vllm_config, kv_cache_spec)
         groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
-    cache_utils = vllm.v1.core.kv_cache_utils
+    if _orig_annotate_eagle_groups is None:
+        # Current Core derives draft ownership from KVCacheSpec.is_draft.
+        return groups
+    cache_utils = planning
     cache_utils._annotate_eagle_groups(
         vllm_config,
         kv_cache_spec,
         groups,
         use_trailing_layer_fallback=cache_utils._uses_trailing_mtp_layers(vllm_config),
     )
-    vllm.v1.core.kv_cache_utils._warn_if_unannotated_eagle_mamba(
+    planning._warn_if_unannotated_eagle_mamba(
         vllm_config,
         groups,
     )
@@ -726,6 +729,10 @@ def _ascend_max_memory_usage_bytes_from_groups(
             )
             return required_pool_blocks * bytes_per_pool_block
     if vllm_version_is("0.28.0") or not _is_deepseek_v4_groups(kv_cache_groups):
+        if hasattr(planning, "DefaultKVCacheConfigBuilder"):
+            from vllm_ascend.core.kv_cache_config_builder import AscendKVCacheConfigBuilder
+
+            return _orig_max_memory_usage_bytes_from_groups(AscendKVCacheConfigBuilder(), vllm_config, kv_cache_groups)
         return _orig_max_memory_usage_bytes_from_groups(vllm_config, kv_cache_groups)
 
     assert all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) for group in kv_cache_groups)
@@ -865,14 +872,22 @@ def _merge_qsa_composite_groups(
             if index == first or index not in consumed
         ]
 
-    result = merge_owners(
-        groups,
-        main_names | compressed_names,
-        "main/compressed",
-        [name for name in kv_cache_spec if name in main_names]
-        + [name for name in kv_cache_spec if name in compressed_names],
-    )
-    return merge_owners(result, raw_names, "raw circular")
+    result = groups
+    for is_draft in (False, True):
+        main = {name for name in main_names if getattr(kv_cache_spec[name], "is_draft", False) == is_draft}
+        compressed = {name for name in compressed_names if getattr(kv_cache_spec[name], "is_draft", False) == is_draft}
+        raw = {name for name in raw_names if getattr(kv_cache_spec[name], "is_draft", False) == is_draft}
+        if main or compressed:
+            result = merge_owners(
+                result,
+                main | compressed,
+                "main/compressed",
+                [name for name in kv_cache_spec if name in main]
+                + [name for name in kv_cache_spec if name in compressed],
+            )
+        if raw:
+            result = merge_owners(result, raw, "raw circular")
+    return result
 
 
 def _merge_mamba_state_groups(
@@ -900,6 +915,7 @@ def _merge_mamba_state_groups(
                 tuple(tuple(shape) for shape in spec.shapes),
                 tuple(str(dtype) for dtype in spec.dtypes),
                 group.is_eagle_group,
+                getattr(spec, "is_draft", False),
             )
             buckets.setdefault(key, []).append(index)
     drop: set[int] = set()
@@ -932,7 +948,16 @@ def _get_ascend_kv_cache_groups(
     if any(is_glm5_next_cache_spec(spec) for spec in kv_cache_spec.values()):
         return get_glm5_next_kv_cache_groups(vllm_config, kv_cache_spec)
     qsa_owners = _prepare_qsa_composite_groups(kv_cache_spec)
-    groups = _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
+    if qsa_owners is not None and any(getattr(spec, "is_draft", False) for spec in kv_cache_spec.values()):
+        # Core annotates groups after this hook. Keep target/draft lifetimes
+        # separate already during grouping, including the uniform fast path.
+        groups = []
+        for is_draft in (False, True):
+            specs = {name: spec for name, spec in kv_cache_spec.items() if spec.is_draft == is_draft}
+            if specs:
+                groups.extend(_orig_get_kv_cache_groups(vllm_config, specs))
+    else:
+        groups = _orig_get_kv_cache_groups(vllm_config, kv_cache_spec)
     if qsa_owners is None:
         return groups
     merged = _merge_qsa_composite_groups(
@@ -954,6 +979,8 @@ def _get_qwen4_exp_six_region_kv_cache_config(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
+    *,
+    num_blocks: int | None = None,
 ) -> KVCacheConfig | None:
     """Plan QSA hybrid storage as six contiguous slabs per ordinal slot.
 
@@ -977,18 +1004,21 @@ def _get_qwen4_exp_six_region_kv_cache_config(
     hidden_bytes_per_block = sum(owner.spec.page_size_bytes for owner in hidden_owners)
     slab_bytes_per_block = sum(region.page_size_bytes for region in probe.regions)
     bytes_per_block = probe.slot_count * slab_bytes_per_block + hidden_bytes_per_block
-    candidate = available_memory // bytes_per_block
-    while candidate > 0:
-        candidate_layout = build_six_region_kv_cache_layout(
-            kv_cache_groups,
-            num_blocks=candidate,
-        )
-        assert candidate_layout is not None
-        required = candidate_layout.slot_count * candidate_layout.slot_backing_size + hidden_bytes_per_block * candidate
-        if required <= available_memory:
-            break
-        candidate -= 1
-    num_blocks = may_override_num_blocks(vllm_config, candidate)
+    if num_blocks is None:
+        candidate = available_memory // bytes_per_block
+        while candidate > 0:
+            candidate_layout = build_six_region_kv_cache_layout(
+                kv_cache_groups,
+                num_blocks=candidate,
+            )
+            assert candidate_layout is not None
+            required = (
+                candidate_layout.slot_count * candidate_layout.slot_backing_size + hidden_bytes_per_block * candidate
+            )
+            if required <= available_memory:
+                break
+            candidate -= 1
+        num_blocks = may_override_num_blocks(vllm_config, candidate)
     layout = build_six_region_kv_cache_layout(
         kv_cache_groups,
         num_blocks=num_blocks,
@@ -1106,21 +1136,24 @@ def _ascend_get_kv_cache_config_from_groups(
 
 vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
 if vllm_version_is("0.28.0"):
-    vllm.v1.core.kv_cache_utils.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
-    vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
+    planning.group_and_unify_kv_cache_specs = group_and_unify_kv_cache_specs
+    planning._get_kv_cache_groups_uniform_groups = _get_kv_cache_groups_uniform_groups
 else:
     assert _orig_get_packed_kv_cache_groups is not None
-    assert _orig_annotate_eagle_groups is not None
-    vllm.v1.core.kv_cache_utils._annotate_eagle_groups = _ascend_annotate_eagle_groups
-    vllm.v1.core.kv_cache_utils._get_packed_kv_cache_groups = _ascend_get_packed_kv_cache_groups
-vllm.v1.core.kv_cache_utils._get_kv_cache_groups_uniform_page_size = _get_kv_cache_groups_uniform_page_size
-vllm.v1.core.kv_cache_utils.get_kv_cache_groups = _get_ascend_kv_cache_groups
+    if _orig_annotate_eagle_groups is not None:
+        planning._annotate_eagle_groups = _ascend_annotate_eagle_groups
+    planning._get_packed_kv_cache_groups = _ascend_get_packed_kv_cache_groups
+planning._get_kv_cache_groups_uniform_page_size = _get_kv_cache_groups_uniform_page_size
+planning.get_kv_cache_groups = _get_ascend_kv_cache_groups
 KVCacheConfig.has_mamba_layers = property(  # type: ignore[assignment]
     _kv_cache_config_has_mamba_layers
 )
-vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups
-vllm.v1.core.kv_cache_utils._max_memory_usage_bytes_from_groups = _ascend_max_memory_usage_bytes_from_groups
-vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
+planning.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups
+if not hasattr(planning, "DefaultKVCacheConfigBuilder"):
+    # The new Core admission path takes a builder and obtains Ascend's pool
+    # geometry through it. Keep that three-argument implementation intact.
+    planning._max_memory_usage_bytes_from_groups = _ascend_max_memory_usage_bytes_from_groups
+planning._pool_bytes_per_block = _ascend_pool_bytes_per_block
 
 # Also patch the reference used by engine/core.py which imports the function directly.
 import vllm.v1.engine.core  # noqa: E402

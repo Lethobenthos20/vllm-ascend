@@ -186,7 +186,12 @@ def build_six_region_kv_cache_layout(
     if not role_members[QSA_RAW]:
         return None
     required = (QSA_MAIN, QSA_RAW, QSA_COMPRESSED, GDN, PLE)
-    missing = [role for role in required if not role_members[role]]
+    # PLE belongs to the first PP stage. Later stages keep the same six-region
+    # descriptor numbering with an empty r6 slab.
+    missing = [
+        role for role in required
+        if role != PLE and not role_members[role]
+    ]
     if missing or unknown:
         details = [(name, type(spec).__name__) for name, spec in unknown]
         raise ValueError(f"Six-region QSA hybrid cache layout is incomplete: missing={missing}, unsupported={details}")
@@ -274,7 +279,7 @@ def build_six_region_kv_cache_layout(
         max(v_bytes for _, v_bytes in main_pages),
         max(_real_page_size_bytes(spec) for _, spec in role_members[QSA_RAW]),
         max(_real_page_size_bytes(spec) for _, spec in role_members[QSA_COMPRESSED]),
-        max(_state_bytes(spec, 0) for spec in ple_specs),
+        max((_state_bytes(spec, 0) for spec in ple_specs), default=0),
     )
 
     max_ssm_bytes = max(_state_bytes(spec, 1) for spec in gdn_specs)

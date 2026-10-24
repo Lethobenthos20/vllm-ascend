@@ -75,7 +75,7 @@ def _get_base_conv1d(layer: nn.Module) -> nn.Module:
 
 
 @torch.no_grad()
-def _pack_conv_weights(conv1d: nn.Module) -> None:
+def _pack_conv_weights(conv1d: nn.Module, *, qwen4_exp: bool = False) -> None:
     """Pack ``[D, 1, W]`` weights into the kernel's ``[W, D]`` layout."""
     source_weight = conv1d.weight
     if source_weight.is_meta:
@@ -92,7 +92,7 @@ def _pack_conv_weights(conv1d: nn.Module) -> None:
         conv1d,
         _PACKED_CONV_WEIGHT_NAME,
         packed_weight,
-        prefer_copy=True,
+        **({} if qwen4_exp else {"prefer_copy": True}),
     )
 
 
@@ -124,7 +124,13 @@ def initialize_packed_conv_weight(layer: nn.Module) -> None:
     @wraps(process_weights_after_loading)
     def process_weights_and_pack(*args, **kwargs):
         result = process_weights_after_loading(*args, **kwargs)
-        _pack_conv_weights(conv1d)
+        text_config = getattr(layer.model_config, "hf_text_config", None)
+        model_type = getattr(text_config, "model_type", None)
+        _pack_conv_weights(
+            conv1d,
+            qwen4_exp=model_type
+            in {"qwen4_exp", "qwen4_exp_text", "qwen4_exp_mtp"},
+        )
         return result
 
     quant_method.process_weights_after_loading = process_weights_and_pack
@@ -221,7 +227,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     @torch.no_grad()
     def _pack_conv_weights(self) -> None:
         """Refresh the kernel-layout convolution parameter in place."""
-        _pack_conv_weights(_get_base_conv1d(self))
+        text_config = getattr(self.model_config, "hf_text_config", None)
+        model_type = getattr(text_config, "model_type", None)
+        _pack_conv_weights(
+            _get_base_conv1d(self),
+            qwen4_exp=model_type
+            in {"qwen4_exp", "qwen4_exp_text", "qwen4_exp_mtp"},
+        )
 
     # Cached fused-op availability probe result, shared across all layers so the
     # smoke call runs at most once per process.

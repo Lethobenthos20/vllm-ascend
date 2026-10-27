@@ -720,6 +720,41 @@ class NPUModelRunner(GPUModelRunner):
                 max_num_reqs=self.max_num_reqs,
                 device=self.device,
             )
+        self._model_input_context_ends = np.zeros(
+            self.max_num_reqs, dtype=np.int32
+        )
+        # Keep one fixed-shape PP feedback buffer per worker.  Reusing it
+        # avoids an allocation on every async speculative step, while the
+        # fixed capacity keeps the collective contract identical across PP
+        # stages even when their visible active-row counts briefly differ.
+        self._pp_sampled_tokens_wire = torch.empty(
+            (self.max_num_reqs, self.num_spec_tokens + 1),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._pp_sampled_tokens_event = None
+        # Set once per worker step after InputBatch state is updated. All PP
+        # stages derive it from the same scheduler output, so a pure/non-final
+        # prefill step skips the auxiliary collective symmetrically.
+        self._pp_sampled_tokens_feedback_needed = True
+        self._pp_sampled_tokens_num_reqs = 0
+        self._pp_sampled_tokens_req_ids: list[str] = []
+        self._pp_sampled_tokens_discarded: set[int] = set()
+        pp = get_pp_group()
+        self._pp_feedback_stream = None
+        self._pp_feedback_group = None
+        if (
+            pp.world_size > 1
+            and self.use_async_scheduling
+            and self.num_spec_tokens > 0
+        ):
+            self._pp_feedback_stream = torch.npu.Stream(device=self.device)
+            # Keep feedback off the communicator used by pipeline hidden-state
+            # send/recv.  Otherwise a tiny broadcast can serialize the whole
+            # PP data path even when it is posted asynchronously.
+            self._pp_feedback_group = pp.make_sibling_device_group(
+                group_desc="ascend_pp_sampled_feedback"
+            )
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -999,70 +1034,153 @@ class NPUModelRunner(GPUModelRunner):
     def _is_pd_prefill_worker(self) -> bool:
         return self.is_kv_producer and not self.is_kv_consumer
 
-    def _apply_pp_sampled_tokens_from_scheduler_output(
-        self,
-        scheduler_output: "SchedulerOutput",
+    def _pp_step_needs_sampled_feedback(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> bool:
+        """Return whether this step can produce tokens consumed by a later step.
+
+        Non-final chunked-prefill steps do not sample. Skipping their auxiliary
+        PP collective is safe only when every stage makes the decision from the
+        same scheduler state; the persistent InputBatch is updated before this
+        helper is called on every rank.
+        """
+        scheduled = scheduler_output.num_scheduled_tokens
+        for req_id, num_scheduled in scheduled.items():
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            if req_index is None or num_scheduled <= 0:
+                continue
+            if (
+                self.input_batch.num_computed_tokens_cpu[req_index]
+                + num_scheduled
+                >= self.input_batch.num_prompt_tokens[req_index]
+            ):
+                return True
+        return False
+
+    def _pp_broadcast_sampled_tokens_and_accepted_counts(
+        self, sampled_token_ids: torch.Tensor
     ) -> None:
+        """Broadcast the current PP output before async scheduling runs ahead."""
         pp = get_pp_group()
-        if (
-            not self.use_async_scheduling
-            or pp.is_last_rank
-            or self._is_pd_prefill_worker()
-        ):
-            return
-
-        self.input_batch.prev_sampled_token_ids = None
-        self.input_batch.prev_req_id_to_index = {}
-
-        req_data = scheduler_output.scheduled_cached_reqs
-        new_token_ids = req_data.new_token_ids
-        if not new_token_ids:
-            return
-
-        num_prev_reqs = self.input_batch.num_reqs
-        if num_prev_reqs == 0:
-            return
-
-        discard_req_indices = np.nonzero(
-            self.discard_request_mask.np[:num_prev_reqs]
-        )[0]
-        discarded = set(discard_req_indices)
-        prev_req_indices = {
-            req_id: req_index
-            for req_index, req_id in enumerate(
-                self.input_batch.req_ids[:num_prev_reqs]
+        assert pp.is_last_rank
+        # PP stages can temporarily observe different active request counts
+        # under async scheduling (a completed/discarded row is retired on the
+        # sampler stage first). A collective must nevertheless have an
+        # identical tensor shape on every participant. Broadcasting the
+        # dynamic sampled tensor directly can therefore leave one PP stage in
+        # HCCL forever. Use the configured request capacity as the wire shape
+        # and mark unused rows/slots with -1.
+        payload = self._pp_sampled_tokens_wire
+        payload.fill_(-1)
+        sampled = sampled_token_ids.to(torch.int32)
+        if sampled.ndim == 1:
+            sampled = sampled.unsqueeze(1)
+        rows = min(sampled.shape[0], self.max_num_reqs)
+        cols = min(sampled.shape[1], self.num_spec_tokens + 1)
+        payload[:rows, :cols].copy_(sampled[:rows, :cols])
+        assert self._pp_feedback_stream is not None
+        assert self._pp_feedback_group is not None
+        main_stream = torch.npu.current_stream()
+        with torch.npu.stream(self._pp_feedback_stream):
+            self._pp_feedback_stream.wait_stream(main_stream)
+            torch.distributed.broadcast(
+                payload,
+                src=pp.last_rank,
+                group=self._pp_feedback_group,
             )
-            if req_index not in discarded
-        }
-        prev_req_id_to_index: dict[str, int] = {}
-        prev_sampled_token_ids = [PLACEHOLDER_TOKEN_ID] * num_prev_reqs
+            self._pp_sampled_tokens_event = (
+                self._pp_feedback_stream.record_event()
+            )
+            payload.record_stream(self._pp_feedback_stream)
 
-        for req_index, req_id in enumerate(req_data.req_ids):
-            if req_index >= len(new_token_ids):
-                break
-            token_ids = new_token_ids[req_index]
-            if not token_ids or req_data.num_output_tokens[req_index] <= 0:
-                continue
-            prev_req_index = prev_req_indices.get(req_id)
-            if prev_req_index is None:
-                continue
-            prev_req_id_to_index[req_id] = prev_req_index
-            prev_sampled_token_ids[prev_req_index] = token_ids[-1]
-            if (req_state := self.requests.get(req_id)) is not None:
-                req_state.output_token_ids.append(PLACEHOLDER_TOKEN_ID)
-            pos = self.input_batch.num_tokens_no_spec[prev_req_index]
-            self.input_batch.is_token_ids[prev_req_index, pos] = True
-            self.input_batch.num_tokens_no_spec[prev_req_index] = pos + 1
+    def _pp_receive_sampled_tokens_and_accepted_counts(self) -> None:
+        """Receive the last PP stage output and publish its previous-row map."""
+        pp = get_pp_group()
+        assert not pp.is_last_rank
+        num_reqs = self.input_batch.num_reqs
+        sampled_wire = self._pp_sampled_tokens_wire
+        assert self._pp_feedback_stream is not None
+        assert self._pp_feedback_group is not None
+        main_stream = torch.npu.current_stream()
+        with torch.npu.stream(self._pp_feedback_stream):
+            self._pp_feedback_stream.wait_stream(main_stream)
+            torch.distributed.broadcast(
+                sampled_wire,
+                src=pp.last_rank,
+                group=self._pp_feedback_group,
+            )
+            sampled = sampled_wire[:num_reqs]
+            # Run the complete recurrent-state correction on the feedback
+            # stream as soon as the tokens arrive. Previously this work was
+            # launched on the next step's main stream after waiting for the
+            # broadcast, serializing every decode iteration. The feedback
+            # stream already waits for the current forward above, so updating
+            # this stage's state here preserves the same ordering while
+            # overlapping with last-stage sampling and EngineCore scheduling.
+            accepted = (sampled != -1).sum(dim=1).to(torch.int32)
+            self.valid_sampled_token_count_gpu = accepted
+            assert self.valid_sampled_token_count_cpu is not None
+            assert self.valid_sampled_token_count_event is not None
+            self.valid_sampled_token_count_cpu[:num_reqs].copy_(
+                accepted, non_blocking=True
+            )
+            self.valid_sampled_token_count_event.record()
+            self.num_accepted_tokens.gpu[:num_reqs].copy_(accepted)
+            if self.cache_config.mamba_cache_mode == "align":
+                mamba_utils.postprocess_mamba_align_gpu(
+                    bufs=self._get_mamba_bufs(),
+                    num_reqs=num_reqs,
+                    num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
+                    num_accepted_tokens_cpu_tensor=self.num_accepted_tokens.cpu,
+                    input_batch=self.input_batch,
+                    kv_cache_config=self.kv_cache_config,
+                    forward_context=self.compilation_config.static_forward_context,
+                    mamba_state_copy_funcs=(
+                        self._get_ascend_mamba_state_copy_funcs()
+                    ),
+                )
+            else:
+                self.num_accepted_tokens.copy_to_cpu(num_reqs)
+            assert self.num_accepted_tokens_event is not None
+            self.num_accepted_tokens_event.record()
+            self._pp_sampled_tokens_event = (
+                self._pp_feedback_stream.record_event()
+            )
+            sampled_wire.record_stream(self._pp_feedback_stream)
+            accepted.record_stream(self._pp_feedback_stream)
+        self._pp_sampled_tokens_num_reqs = num_reqs
+        self._pp_sampled_tokens_req_ids = list(
+            self.input_batch.req_ids[:num_reqs]
+        )
+        self._pp_sampled_tokens_discarded = set(
+            np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
+        )
 
-        if not prev_req_id_to_index:
+    def _finish_pp_sampled_tokens_feedback(self) -> None:
+        """Finish the previous PP feedback before its batch state is updated."""
+        event = self._pp_sampled_tokens_event
+        if event is None:
+            return
+        torch.npu.current_stream().wait_event(event)
+        self._pp_sampled_tokens_event = None
+        if get_pp_group().is_last_rank:
             return
 
-        self.input_batch.prev_req_id_to_index = prev_req_id_to_index
-        self.input_batch.prev_sampled_token_ids = torch.tensor(
-            prev_sampled_token_ids,
-            dtype=torch.int32,
-            device=self.device,
-        ).unsqueeze(1)
+        num_reqs = self._pp_sampled_tokens_num_reqs
+        sampled = self._pp_sampled_tokens_wire[:num_reqs]
+        self.input_batch.prev_sampled_token_ids = sampled
+        self.input_batch.prev_req_id_to_index = {
+            req_id: index
+            for index, req_id in enumerate(self._pp_sampled_tokens_req_ids)
+            if index not in self._pp_sampled_tokens_discarded
+        }
+        # Accepted-count publication and GDN/Mamba state correction were
+        # already enqueued behind the receive on the feedback stream. Waiting
+        # for the recorded event above makes both the device state and pinned
+        # CPU mirrors visible before input preparation consumes them.
+        self._pp_sampled_tokens_num_reqs = 0
+        self._pp_sampled_tokens_req_ids = []
+        self._pp_sampled_tokens_discarded = set()
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         self._update_replay_requests(scheduler_output)
@@ -1080,7 +1198,6 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
-        self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
         if scheduler_output.kv_cache_block_copies:
             # The upstream helper assumes one block-major backing storage.
             # Ascend can pack multiple block-indexed segments (notably Mamba
@@ -1787,7 +1904,10 @@ class NPUModelRunner(GPUModelRunner):
             and valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
         )
-        if self._needs_seq_lens_cpu_sync and async_spec_decode_active:
+        if async_spec_decode_active and (
+            self._needs_seq_lens_cpu_sync
+            or self.qwen4_exp_input_adapter is not None
+        ):
             self._correct_optimistic_seq_lens_cpu(num_reqs)
 
         replay_start = self._fill_replay_start(num_reqs)
@@ -2424,6 +2544,11 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        # PP feedback was posted at the end of the previous worker step.  Wait
+        # only when its state is about to be consumed, allowing the collective
+        # to overlap EngineCore scheduling and inter-stage work in between.
+        self._finish_pp_sampled_tokens_feedback()
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -2493,6 +2618,14 @@ class NPUModelRunner(GPUModelRunner):
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
+                if (
+                    self.use_async_scheduling
+                    and self.speculative_config is not None
+                    and pp_group.world_size > 1
+                ):
+                    self._pp_sampled_tokens_feedback_needed = (
+                        self._pp_step_needs_sampled_feedback(scheduler_output)
+                    )
 
                 if has_ec_transfer() and not get_ec_transfer().is_consumer:
                     self._start_dump_data(scheduled_tokens = scheduler_output.num_scheduled_tokens)
@@ -2960,6 +3093,12 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
+            if (
+                self.use_async_scheduling
+                and use_pp_spec_decode
+                and self._pp_sampled_tokens_feedback_needed
+            ):
+                self._pp_receive_sampled_tokens_and_accepted_counts()
             if not kv_connector_output:
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
@@ -3119,7 +3258,21 @@ class NPUModelRunner(GPUModelRunner):
                 torch.npu.stream(global_stream()),
             ):
                 global_stream().wait_event(self.sampling_done_event)
-                self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+                if (
+                    use_pp_spec_decode
+                    and pp.is_last_rank
+                    and self._pp_sampled_tokens_feedback_needed
+                ):
+                    # Publish feedback as soon as sampling completes. The
+                    # receiver stages need it before their next recurrent
+                    # forward, while this stage's state correction below is
+                    # independent and can overlap the side-stream collective.
+                    self._pp_broadcast_sampled_tokens_and_accepted_counts(
+                        sampler_output.sampled_token_ids
+                    )
+                self._update_states_after_model_execute(
+                    sampler_output.sampled_token_ids, scheduler_output
+                )
 
         if not self.use_async_scheduling:
             return model_runner_output
@@ -3676,6 +3829,22 @@ class NPUModelRunner(GPUModelRunner):
             Qwen4ExpInputContext,
         )
 
+        context_ends = self.input_batch.num_computed_tokens_cpu
+        if self.use_async_spec_decode and not is_dummy:
+            # The scheduler advances CPU num_computed_tokens optimistically by
+            # the full speculative width. _prepare_inputs has already applied
+            # the previous step's accepted-count correction to
+            # optimistic_seq_lens_cpu. Subtract this step's query width to get
+            # the true history boundary consumed by PLE.
+            query_lens = np.diff(
+                self.query_start_loc.np[: num_reqs + 1]
+            )
+            np.subtract(
+                self.optimistic_seq_lens_cpu.numpy()[:num_reqs],
+                query_lens,
+                out=self._model_input_context_ends[:num_reqs],
+            )
+            context_ends = self._model_input_context_ends
         adapter.prepare(
             model_kwargs,
             Qwen4ExpInputContext(
@@ -3683,7 +3852,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs_padded=num_reqs_padded,
                 is_dummy=is_dummy,
                 query_start_loc=self.query_start_loc.gpu,
-                num_computed_tokens=self.input_batch.num_computed_tokens_cpu,
+                num_computed_tokens=context_ends,
                 token_ids=self.input_batch.token_ids_cpu,
             ),
         )
@@ -4272,7 +4441,12 @@ class NPUModelRunner(GPUModelRunner):
             # But gdn needs an unpadded one.
             # gdn_query_start_loc is an unpadded version of query_start_loc.
             # TODO delete it if fia's check is removed.
-            if self._has_gdn:
+            # A PP stage can receive the engine-wide KV-cache group layout,
+            # including padding-only groups whose layers live on another
+            # stage. Such a group intentionally has no local attention
+            # backend or metadata builder. Only inspect the first builder
+            # when this stage actually owns an attention group.
+            if self._has_gdn and self.attn_groups[kv_cache_gid]:
                 attn_group = self.attn_groups[kv_cache_gid][0]
                 builder = attn_group.get_metadata_builder(0)
                 if isinstance(builder, GDNAttentionMetadataBuilder):
@@ -5041,6 +5215,42 @@ class NPUModelRunner(GPUModelRunner):
             self._debugger_started = False
 
         self.debugger.step(**kwargs)
+
+    def initialize_metadata_builders(
+        self,
+        kv_cache_config: KVCacheConfig,
+        kernel_block_sizes: list[int],
+    ) -> None:
+        """Initialize target metadata on every PP stage and draft metadata
+        only where the drafter is owned.
+
+        Upstream initializes the speculative drafter whenever speculative
+        decoding is configured. In pipeline execution, however, only the last
+        stage owns sampling and the MTP drafter; earlier stages intentionally
+        keep ``self.drafter`` unset. Temporarily hide only the runner-local
+        speculative flag so the upstream routine still creates every target
+        attention builder without asserting that a non-owner stage has a
+        drafter. The complete configuration remains available through
+        ``self.vllm_config`` and is restored before this method returns.
+        """
+        speculative_config = self.speculative_config
+        skip_drafter_init = (
+            speculative_config is not None
+            and self.drafter is None
+            and not get_pp_group().is_last_rank
+        )
+        if not skip_drafter_init:
+            return super().initialize_metadata_builders(
+                kv_cache_config, kernel_block_sizes
+            )
+
+        self.speculative_config = None
+        try:
+            super().initialize_metadata_builders(
+                kv_cache_config, kernel_block_sizes
+            )
+        finally:
+            self.speculative_config = speculative_config
 
     def initialize_kv_cache(
         self,

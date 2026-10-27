@@ -187,7 +187,8 @@ def qsa_gbsa_attention(
         rounding_mode="floor",
     )
     valid = (sparse_idx >= 0) & (sparse_idx < full_blocks.unsqueeze(1))
-    order = torch.argsort((~valid).to(torch.int32), dim=1, stable=True)
+    sort_key = (~valid).to(torch.float32)
+    order = torch.argsort(sort_key, dim=1, stable=True)
     sparse_idx = sparse_idx.gather(1, order)
     sparse_count = valid.sum(dim=1).to(torch.int32)
     sparse_idx = sparse_idx.unsqueeze(0).expand(num_kv_heads, -1, -1).contiguous()

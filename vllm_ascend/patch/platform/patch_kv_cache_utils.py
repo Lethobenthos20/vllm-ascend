@@ -457,6 +457,12 @@ def _ascend_annotate_eagle_groups(
     ):
         return
 
+    # The upstream positional fallback sees the last target GDN cache before
+    # the separately registered Qwen MTP caches and marks that target group as
+    # draft-owned. Rebuild ownership from the model-scoped MTP layer names.
+    for group in kv_cache_groups:
+        group.is_eagle_group = False
+
     text_config = vllm_config.model_config.hf_text_config
     first_draft_layer = int(text_config.num_hidden_layers)
     num_draft_layers = int(
@@ -482,8 +488,6 @@ def _ascend_annotate_eagle_groups(
         if any(marker in f".{layer_name}." for marker in draft_markers for layer_name in group.layer_names):
             group.is_eagle_group = True
 
-    if not any(group.is_eagle_group for group in kv_cache_groups):
-        raise ValueError(f"Qwen4Exp MTP is enabled, but no KV cache group contains its draft layer(s) {draft_markers}.")
 
 
 def _ascend_get_packed_kv_cache_groups(
@@ -967,23 +971,43 @@ def _merge_mamba_state_groups(
     """
     buckets: dict[tuple, list[int]] = {}
     for index, group in enumerate(groups):
-        spec = group.kv_cache_spec
-        if isinstance(spec, MambaSpec) and not isinstance(spec, UniformTypeKVCacheSpecs):
-            key = (
+        group_spec = group.kv_cache_spec
+        specs = (
+            tuple(group_spec.kv_cache_specs.values())
+            if isinstance(group_spec, UniformTypeKVCacheSpecs)
+            else (group_spec,)
+        )
+        if not specs or not all(isinstance(spec, MambaSpec) for spec in specs):
+            continue
+        signatures = {
+            (
+                spec.block_size,
                 spec.page_size_bytes,
                 tuple(tuple(shape) for shape in spec.shapes),
                 tuple(str(dtype) for dtype in spec.dtypes),
-                group.is_eagle_group,
+                getattr(spec, "is_draft", False),
             )
-            buckets.setdefault(key, []).append(index)
+            for spec in specs
+        }
+        if len(signatures) != 1:
+            continue
+        key = (*next(iter(signatures)), group.is_eagle_group)
+        buckets.setdefault(key, []).append(index)
     drop: set[int] = set()
     replacements: dict[int, KVCacheGroupSpec] = {}
     for indices in buckets.values():
         if len(indices) < 2:
             continue
         names = [name for index in indices for name in groups[index].layer_names]
+        merged_specs = {}
+        for idx in indices:
+            group_spec = groups[idx].kv_cache_spec
+            if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                merged_specs.update(group_spec.kv_cache_specs)
+            else:
+                merged_specs.update({name: group_spec for name in groups[idx].layer_names})
         uniform = UniformTypeKVCacheSpecs.from_specs(
-            {name: groups[idx].kv_cache_spec for idx in indices for name in groups[idx].layer_names}
+            {name: merged_specs[name] for name in names}
         )
         if uniform is None:
             continue

@@ -172,6 +172,18 @@ def test_six_region_offsets_are_contiguous_non_overlapping_slabs() -> None:
         assert right.offset >= left.end
         assert right.offset % layout.alignment == 0
 
+
+def test_six_region_allows_pp_stage_without_ple_owner() -> None:
+    groups = [
+        group
+        for group in _groups()
+        if not any(name == "model.ple" for name in group.layer_names)
+    ]
+    layout = build_six_region_kv_cache_layout(groups, num_blocks=3)
+    assert layout is not None
+    assert layout.region("r6").page_size_bytes == 0
+    assert all(owner.role != PLE for owner in layout.owners)
+
     for slot, source in enumerate(
         [
             "model.layers.11.self_attn",
@@ -183,7 +195,6 @@ def test_six_region_offsets_are_contiguous_non_overlapping_slabs() -> None:
         assert layout.owner(f"{source}.indexer.raw_key_cache").slot == slot
         assert layout.owner(f"{source}.indexer.compressed_key_cache").slot == slot
     assert layout.owner("model.layers.0.linear_attn").role == GDN
-    assert layout.owner("model.ple").role == PLE
     assert layout.owner("model.cache_only_layers.0").role == HIDDEN
 
 

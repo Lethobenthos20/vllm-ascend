@@ -75,7 +75,7 @@ def _get_base_conv1d(layer: nn.Module) -> nn.Module:
 
 
 @torch.no_grad()
-def _pack_conv_weights(conv1d: nn.Module) -> None:
+def _pack_conv_weights(conv1d: nn.Module, *, qwen4_exp: bool = False) -> None:
     """Pack ``[D, 1, W]`` weights into the kernel's ``[W, D]`` layout."""
     source_weight = conv1d.weight
     if source_weight.is_meta:
@@ -92,7 +92,7 @@ def _pack_conv_weights(conv1d: nn.Module) -> None:
         conv1d,
         _PACKED_CONV_WEIGHT_NAME,
         packed_weight,
-        prefer_copy=True,
+        **({} if qwen4_exp else {"prefer_copy": True}),
     )
 
 
@@ -124,7 +124,13 @@ def initialize_packed_conv_weight(layer: nn.Module) -> None:
     @wraps(process_weights_after_loading)
     def process_weights_and_pack(*args, **kwargs):
         result = process_weights_after_loading(*args, **kwargs)
-        _pack_conv_weights(conv1d)
+        text_config = getattr(layer.model_config, "hf_text_config", None)
+        model_type = getattr(text_config, "model_type", None)
+        _pack_conv_weights(
+            conv1d,
+            qwen4_exp=model_type
+            in {"qwen4_exp", "qwen4_exp_text", "qwen4_exp_mtp"},
+        )
         return result
 
     quant_method.process_weights_after_loading = process_weights_and_pack
@@ -148,6 +154,7 @@ def _flatten_recurrent_state_indices(
     state_indices: torch.Tensor,
     total_tokens: int,
     query_start_loc: torch.Tensor | None = None,
+    flat_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reduce state indices to exactly one entry per recurrent token.
 
@@ -170,6 +177,8 @@ def _flatten_recurrent_state_indices(
         return state_indices.reshape(-1).contiguous()
     if query_start_loc is None:
         raise ValueError("query_start_loc is required to flatten non-uniform speculative state indices")
+    if flat_indices is not None:
+        return state_indices.reshape(-1)[flat_indices]
     # Variable-length speculative sequences: map each token to its
     # (sequence, slot) pair on device. The output length is host-known
     # (total_tokens), so this path stays sync-free, unlike masked_select or
@@ -181,7 +190,37 @@ def _flatten_recurrent_state_indices(
     token_ids = torch.arange(total_tokens, device=state_indices.device, dtype=qsl.dtype)
     seq_ids = torch.searchsorted(bounds, token_ids, right=True).clamp_(max=num_seqs - 1)
     slot_ids = (token_ids - starts[seq_ids]).clamp_(min=0, max=num_slots - 1)
-    return state_indices[seq_ids, slot_ids].contiguous()
+    return state_indices.reshape(-1)[seq_ids * num_slots + slot_ids]
+
+
+def _get_recurrent_state_flat_indices(
+    metadata: object,
+    state_indices: torch.Tensor,
+    total_tokens: int,
+    query_start_loc: torch.Tensor,
+) -> torch.Tensor | None:
+    """Build the layer-independent token-to-state mapping once per step."""
+    if state_indices.ndim != 2 or total_tokens == state_indices.numel():
+        return None
+    cached = getattr(metadata, "recurrent_state_flat_indices", None)
+    if cached is not None and cached.numel() == total_tokens:
+        return cached
+    num_seqs, num_slots = state_indices.shape
+    qsl = query_start_loc[: num_seqs + 1]
+    lens = (qsl[1:] - qsl[:-1]).clamp(min=0, max=num_slots)
+    bounds = lens.cumsum(0)
+    starts = bounds - lens
+    token_ids = torch.arange(
+        total_tokens, device=state_indices.device, dtype=qsl.dtype
+    )
+    seq_ids = torch.searchsorted(bounds, token_ids, right=True).clamp(
+        max=num_seqs - 1
+    )
+    flat_indices = seq_ids * num_slots + (
+        token_ids - starts[seq_ids]
+    ).clamp(min=0, max=num_slots - 1)
+    metadata.recurrent_state_flat_indices = flat_indices
+    return flat_indices
 
 
 def _split_head_first_conv_output(
@@ -221,7 +260,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     @torch.no_grad()
     def _pack_conv_weights(self) -> None:
         """Refresh the kernel-layout convolution parameter in place."""
-        _pack_conv_weights(_get_base_conv1d(self))
+        text_config = getattr(self.model_config, "hf_text_config", None)
+        model_type = getattr(text_config, "model_type", None)
+        _pack_conv_weights(
+            _get_base_conv1d(self),
+            qwen4_exp=model_type
+            in {"qwen4_exp", "qwen4_exp_text", "qwen4_exp_mtp"},
+        )
 
     # Cached fused-op availability probe result, shared across all layers so the
     # smoke call runs at most once per process.
@@ -718,6 +763,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     spec_state_indices_tensor,
                     query_spec.shape[1],
                     spec_causal_conv1d_meta.query_start_loc,
+                    _get_recurrent_state_flat_indices(
+                        spec_causal_conv1d_meta,
+                        spec_state_indices_tensor,
+                        query_spec.shape[1],
+                        spec_causal_conv1d_meta.query_start_loc,
+                    ),
                 ),
                 num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
             ).unsqueeze(0)

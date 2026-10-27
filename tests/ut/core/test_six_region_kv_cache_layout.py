@@ -195,7 +195,6 @@ def test_six_region_allows_pp_stage_without_ple_owner() -> None:
         assert layout.owner(f"{source}.indexer.raw_key_cache").slot == slot
         assert layout.owner(f"{source}.indexer.compressed_key_cache").slot == slot
     assert layout.owner("model.layers.0.linear_attn").role == GDN
-    assert layout.owner("model.ple").role == PLE
     assert layout.owner("model.cache_only_layers.0").role == HIDDEN
 
 

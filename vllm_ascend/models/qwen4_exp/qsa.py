@@ -550,10 +550,11 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
         if not self._main_fused_norm_rope_eligible(qkv, positions):
             raise ValueError("QSA main-attention fused norm+RoPE ABI is not satisfied")
 
-        # Index the same rotary cache with the original scheduler positions.
-        # This preserves 1-D text positions, 3-axis interleaved MRoPE, and any
-        # non-zero position offset represented by the incoming position tensor.
-        cos_sin = self.rotary_emb.cos_sin_cache[positions]
+        # Preserve valid scheduler positions while mapping padded profiling rows
+        # to a safe cache entry, matching the QSA indexer path above.
+        cache = self.rotary_emb.cos_sin_cache
+        safe_positions = positions.clamp(0, cache.shape[0] - 1).contiguous()
+        cos_sin = cache[safe_positions]
         if cos_sin.device != qkv.device:
             cos_sin = cos_sin.to(qkv.device)
         if cos_sin.dtype != qkv.dtype:

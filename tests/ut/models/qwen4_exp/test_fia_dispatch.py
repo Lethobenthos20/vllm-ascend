@@ -74,7 +74,12 @@ def test_fia_passes_gqa_heads_causal_mask_and_zeroes_empty_rows(implementation):
     assert calls[0]["num_query_heads"] == 4
     assert calls[0]["num_key_value_heads"] == 1
     assert calls[0]["block_table"] is None
-    assert calls[0]["atten_mask"][0, 0, 1].tolist() == [False, False, True, True]
+    assert calls[0]["input_layout"] == "TND"
+    assert calls[0]["sparse_mode"] == 1
+    assert calls[0]["query"].shape == (4, 4, 8)
+    assert calls[0]["key"].shape == (4, 1, 8)
+    assert calls[0]["actual_seq_qlen"] == [4]
+    assert calls[0]["atten_mask"][0, 1].tolist() == [False, False, True, True]
     assert torch.all(result[0] == 0)
     assert torch.all(result[1:] == 1)
 
@@ -399,4 +404,44 @@ def test_fia_helper_tiles_mask_memory_for_eligible_prefill(implementation):
         32,
         torch.empty_like(query),
     )
-    assert [c["query"].shape[1] for c in calls] == [2, 2, 1]
+    assert [c["query"].shape[0] for c in calls] == [2, 2, 1]
+    assert [c["actual_seq_qlen"] for c in calls] == [[2], [2], [1]]
+    assert all(c["input_layout"] == "TND" and c["sparse_mode"] == 1 for c in calls)
+
+
+@pytest.mark.parametrize("heads,dim", [(3, 256), (4, 128), (6, 64)])
+@pytest.mark.parametrize("paged", [False, True])
+def test_tnd_allmask_dynamic_shape_and_paged_layout(implementation, heads, dim, paged):
+    calls = []
+
+    def fia(**kwargs):
+        calls.append(kwargs)
+        return torch.ones_like(kwargs["query"]), None
+
+    implementation["torch_npu"] = SimpleNamespace(npu_fused_infer_attention_score_v2=fia)
+    rows, kv = 17, 257 if paged else 17
+    query = torch.zeros(rows, heads, dim, dtype=torch.bfloat16)
+    key = torch.zeros((3, 128, dim) if paged else (kv, 1, dim), dtype=query.dtype)
+    table = torch.tensor([[2, 0, 1]], dtype=torch.int32) if paged else None
+    compact = torch.tensor([[0, -1, -1, -1]] * rows)
+    result = implementation["qsa_fia_attention"](
+        query,
+        key,
+        key,
+        compact,
+        torch.arange(kv - rows + 1, kv + 1),
+        kv,
+        torch.empty_like(query),
+        block_table=table,
+    )
+    call = calls[0]
+    assert call["query"].shape == (rows, heads, dim)
+    assert call["key"].shape == key.shape
+    assert call["key"].data_ptr() == key.data_ptr()
+    assert call["input_layout"] == "TND" and call["sparse_mode"] == 1
+    assert call["actual_seq_qlen"] == [rows]
+    assert call["actual_seq_kvlen"] == [kv]
+    assert call["atten_mask"].shape == (1, rows, 384 if paged else kv)
+    assert call["block_table"] is table
+    assert call["block_size"] == (128 if paged else 0)
+    assert result.shape == query.shape

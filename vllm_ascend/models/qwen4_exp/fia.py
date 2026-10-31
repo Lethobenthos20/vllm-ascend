@@ -104,17 +104,24 @@ def qsa_fia_attention(
     block_table: torch.Tensor | None = None,
     kv_lengths: list[int] | None = None,
 ) -> torch.Tensor:
-    """Attend a prefill request or a batch of single-token paged Decode requests."""
+    """Attend a prefill request or a batch of single-token paged Decode requests.
+
+    Single-request TND/allMask requires a CANN build supporting the model's
+    head dimension, with matching host tiling and device kernel versions.
+    """
     num_heads, head_dim = query.shape[1:]
     batch_size = len(kv_lengths) if kv_lengths is not None else 1
+    # Dispatch calls Prefill one request at a time. Keep the legacy batched
+    # helper unchanged; production Decode continues to use GBSA.
+    use_tnd = batch_size == 1
     if batch_size != 1 and (block_table is None or query.shape[0] != batch_size):
         raise ValueError("Batched QSA FIA requires one paged query per request")
     if query.dtype not in (torch.float16, torch.bfloat16) or key.dtype != query.dtype or value.dtype != query.dtype:
         raise ValueError("QSA FIA requires matching FP16/BF16 Q/K/V")
     if block_table is None:
         num_kv_heads = key.shape[1]
-        key = key.reshape(1, kv_length, num_kv_heads * head_dim).contiguous()
-        value = value.reshape(1, kv_length, num_kv_heads * head_dim).contiguous()
+        key = key.reshape(kv_length, num_kv_heads, head_dim).contiguous()
+        value = value.reshape(kv_length, num_kv_heads, head_dim).contiguous()
         mask_kv_length = kv_length
     else:
         num_kv_heads = key.shape[-1] // head_dim
@@ -159,9 +166,18 @@ def qsa_fia_attention(
             atten_mask = (~allowed).contiguous()
             atten_mask[..., 0] &= has_selection.reshape(1, 1, -1)
         query_length = (end - start) // batch_size
-        atten_mask = atten_mask.reshape(batch_size, 1, query_length, mask_kv_length)
+        # allMask uses the full selection mask, including per-query causality.
+        # Paged K/V retain the physical page layout even with a TND query.
+        atten_mask = (
+            atten_mask.reshape(1, query_length, mask_kv_length)
+            if use_tnd
+            else atten_mask.reshape(batch_size, 1, query_length, mask_kv_length)
+        )
+        fia_query = query[start:end]
+        if not use_tnd:
+            fia_query = fia_query.reshape(batch_size, query_length, num_heads * head_dim)
         result, _ = torch_npu.npu_fused_infer_attention_score_v2(
-            query=query[start:end].reshape(batch_size, query_length, num_heads * head_dim).contiguous(),
+            query=fia_query.contiguous(),
             key=key,
             value=value,
             atten_mask=atten_mask,
@@ -170,8 +186,8 @@ def qsa_fia_attention(
             num_query_heads=num_heads,
             num_key_value_heads=num_kv_heads,
             softmax_scale=head_dim**-0.5,
-            input_layout="BSH",
-            sparse_mode=0,
+            input_layout="TND" if use_tnd else "BSH",
+            sparse_mode=1 if use_tnd else 0,
             inner_precise=0,
             block_table=block_table,
             block_size=GBSA_PAGE_SIZE if block_table is not None else 0,

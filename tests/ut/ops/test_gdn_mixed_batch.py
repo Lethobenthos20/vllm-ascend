@@ -308,7 +308,9 @@ def test_decode_forward_does_not_reconcat_qkv(speculative, adaptive, recover):
             num_accepted_tokens=torch.tensor([1, 2], dtype=torch.int32),
         ),
         actual_seq_lengths=torch.tensor([0, 2, 2], dtype=torch.int32),
+        use_upstream_recurrent=adaptive,
     )
+    conv_metadata = metadata.spec_decode_metadata.spec_causal_conv1d
     output = torch.empty(4, 1, 2)
     context = ForwardContext(
         no_compile_layers={layer.prefix: layer},

@@ -52,6 +52,9 @@ class AscendQwen4ExpQSAAttention:
 
     def __init__(self):
         self.layer_name = "model.layers.0.self_attn"
+        # The adapter attaches this fixed-address buffer before model replay.
+        # Keep the annotation uninitialized so the stub matches that lifecycle.
+        self._qsa_prepared_cos_sin: torch.Tensor
         self.num_heads = 4
         self.num_kv_heads = 2
         self.head_dim = 256

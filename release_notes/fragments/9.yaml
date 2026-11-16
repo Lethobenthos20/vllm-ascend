@@ -1,0 +1,8 @@
+pr: 9
+entries:
+  - category: breaking
+    text: >-
+      Revert Qwen3.8-Flash-Next MTP draft-config compatibility to the two-argument
+      upstream API. Builds requiring an explicit third layer-count argument are
+      no longer supported by this adapter; the MTP RoPE cache alignment is retained.
+    model: Qwen3.8-Flash-Next

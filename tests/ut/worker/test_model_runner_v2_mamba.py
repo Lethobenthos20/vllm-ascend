@@ -2,7 +2,7 @@ import ast
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -488,6 +488,7 @@ def test_kimi_pcp_metadata_respects_target_and_draft_groups(is_target):
         device_metadata=None,
         recoverssm=None,
     )
+    state._uses_global_mamba_pcp = MethodType(AscendMambaHybridModelState._uses_global_mamba_pcp, state)
     mamba_group = _group(_mamba_spec())
     sfa_group = SimpleNamespace(kv_cache_spec=object())
     local_batch, blocks, slots = object(), object(), object()
@@ -562,6 +563,7 @@ def test_kimi_pcp_builds_metadata_in_one_device_lifecycle(graph_mode, for_captur
         device_metadata=owner,
         recoverssm=None,
     )
+    state._uses_global_mamba_pcp = MethodType(AscendMambaHybridModelState._uses_global_mamba_pcp, state)
     sfa, kda = SimpleNamespace(), SimpleNamespace()
     with patch.object(
         AscendMambaHybridModelState,
@@ -665,6 +667,7 @@ def test_glm_kpool_pcp_builds_mamba_metadata_from_global_requests(recover, for_c
         vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_kpool=4))),
         recoverssm=SimpleNamespace(record_step=MagicMock()) if recover else None,
     )
+    state._uses_global_mamba_pcp = MethodType(AscendMambaHybridModelState._uses_global_mamba_pcp, state)
     mamba_spec = _mamba_spec()
     attn_groups = [[SimpleNamespace(kv_cache_spec=object())], [_group(mamba_spec)]]
     local_metadata = {"sfa": object()}
@@ -727,6 +730,7 @@ def test_glm_kpool_pcp_advances_mamba_align_state_once_per_global_request(mock_k
         _mamba_src_col_gpu=torch.zeros(4, dtype=torch.int32),
         _mamba_src_off_gpu=torch.zeros(4, dtype=torch.int32),
     )
+    state._uses_global_mamba_pcp = MethodType(AscendMambaHybridModelState._uses_global_mamba_pcp, state)
     local_batch = SimpleNamespace(num_reqs=2)
     num_computed_tokens = torch.zeros(4, dtype=torch.int32)
 

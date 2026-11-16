@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_ascend.models.qwen4_exp import mtp
 
 
@@ -59,12 +61,56 @@ def test_draft_config_remaps_modelslim_description(monkeypatch) -> None:
     monkeypatch.setattr(
         mtp,
         "_upstream_make_draft_vllm_config",
-        lambda _config, _start: draft_config,
+        lambda _config, _start, _num_layers: draft_config,
     )
 
-    actual = mtp._make_draft_vllm_config(target_config, mtp_start_layer_idx=48)
+    actual = mtp._make_draft_vllm_config(target_config, 48, 1)
 
     assert actual is draft_config
     assert draft_config.quant_config.quant_description == {
         "mtp.layers.48.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+    }
+
+
+def test_draft_config_forwards_explicit_mtp_layer_count(monkeypatch) -> None:
+    draft_config = SimpleNamespace(
+        quant_config=SimpleNamespace(quant_description={"mtp.layers.1.mlp.weight": "W4A8_DYNAMIC"})
+    )
+    target_config = SimpleNamespace()
+    calls = []
+
+    def make_draft(config, start, num_layers):
+        calls.append((config, start, num_layers))
+        return draft_config
+
+    monkeypatch.setattr(mtp, "_upstream_make_draft_vllm_config", make_draft)
+    actual = mtp._make_draft_vllm_config(target_config, 48, 2)
+
+    assert actual is draft_config
+    assert calls == [(target_config, 48, 2)]
+    assert draft_config.quant_config.quant_description == {
+        "mtp.layers.49.mlp.weight": "W4A8_DYNAMIC",
+    }
+
+
+@pytest.mark.parametrize("hf_config", [SimpleNamespace(), SimpleNamespace(mtp_num_hidden_layers=2)])
+def test_draft_config_preserves_legacy_two_argument_api(monkeypatch, hf_config) -> None:
+    last_layer = getattr(hf_config, "mtp_num_hidden_layers", 1) - 1
+    draft_config = SimpleNamespace(
+        quant_config=SimpleNamespace(quant_description={f"mtp.layers.{last_layer}.mlp.weight": "W4A8_DYNAMIC"})
+    )
+    target_config = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=hf_config))
+    calls = []
+
+    def make_draft(config, start):
+        calls.append((config, start))
+        return draft_config
+
+    monkeypatch.setattr(mtp, "_upstream_make_draft_vllm_config", make_draft)
+    actual = mtp._make_draft_vllm_config(target_config, 48)
+
+    assert actual is draft_config
+    assert calls == [(target_config, 48)]
+    assert draft_config.quant_config.quant_description == {
+        f"mtp.layers.{48 + last_layer}.mlp.weight": "W4A8_DYNAMIC",
     }

@@ -132,6 +132,7 @@ class QSAIndexerMetadataProtocol(Protocol):
     logical_positions: torch.Tensor
     query_start_loc: torch.Tensor
     seq_lens: torch.Tensor
+    write_metadata: "QSAIndexerMetadataProtocol"
 
 
 def _qsa_cache_is_bound(kv_cache: QSAKVCache) -> bool:
@@ -200,11 +201,17 @@ def apply_qsa_rope(
 class AscendQSAIndexer(upstream_indexer.QSAIndexer):
     """QSA indexer using NPU-compatible cache, RoPE and top-k operators."""
 
+    # Upstream renamed both cache-owner classes across supported vLLM trees;
+    # keep the attributes explicit while the runtime compatibility branch
+    # selects their concrete implementations.
+    raw_key_cache: Any
+    compressed_key_cache: Any
+
     def configure_pcp_cache_backends(self, vllm_config: VllmConfig) -> None:
         # Only the cache owners need new backends. Keep upstream's indexer
         # projection, cache dtype and ring configuration.
-        raw = self.raw_key_cache
-        compressed = self.compressed_key_cache
+        raw: Any = self.raw_key_cache
+        compressed: Any = self.compressed_key_cache
         static_context = vllm_config.compilation_config.static_forward_context
         del static_context[raw.prefix], static_context[compressed.prefix]
         self.raw_key_cache = AscendPCPQSARawKeyCache(
@@ -841,7 +848,7 @@ QSAIndexerBackend.uses_descriptor_cache_view = True
 qsa_indexer.build_qsa_metadata = qsa_indexer._build_qsa_metadata_torch
 
 
-class AscendPCPQSAIndexerMetadataBuilder(QSAIndexerMetadataBuilder):
+class AscendPCPQSAIndexerMetadataBuilder(QSAIndexerMetadataBuilder):  # type: ignore[valid-type, misc]
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         # Read metadata addresses the local prefill segments. Write
         # metadata needs separate buffers and the original requests.
@@ -872,7 +879,7 @@ class AscendPCPQSAIndexerMetadataBuilder(QSAIndexerMetadataBuilder):
         return metadata
 
 
-class AscendPCPQSAIndexerBackend(QSAIndexerBackend):
+class AscendPCPQSAIndexerBackend(QSAIndexerBackend):  # type: ignore[valid-type, misc]
     @classmethod
     def supports_pcp(cls) -> bool:
         return True
@@ -882,7 +889,7 @@ class AscendPCPQSAIndexerBackend(QSAIndexerBackend):
         return AscendPCPQSAIndexerMetadataBuilder
 
 
-class AscendPCPQSARawKeyCache(QSARawKeyCache):
+class AscendPCPQSARawKeyCache(QSARawKeyCache):  # type: ignore[valid-type, misc]
     def get_attn_backend(self) -> type[AscendPCPQSAIndexerBackend]:
         return AscendPCPQSAIndexerBackend
 

@@ -1431,8 +1431,23 @@ class AscendGDNFusedAttentionBackend(AscendGDNAttentionBackend):
 
 
 class AscendGDNPCPMetadataBuilder(AscendGDNAttentionMetadataBuilder):
-    def build(self, common_prefix_len, common_attn_metadata, **kwargs):
-        metadata = super().build(common_prefix_len, common_attn_metadata, **kwargs)
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+        fast_build: bool = False,
+        num_actual_reqs: int | None = None,
+    ) -> GDNAttentionMetadata:
+        metadata = super().build(
+            common_prefix_len,
+            common_attn_metadata,
+            num_accepted_tokens=num_accepted_tokens,
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            fast_build=fast_build,
+            num_actual_reqs=num_actual_reqs,
+        )
         context = common_attn_metadata.pcp_context
         metadata.pcp_context = context if context is not None and context.local_token_indices is not None else None
         return metadata

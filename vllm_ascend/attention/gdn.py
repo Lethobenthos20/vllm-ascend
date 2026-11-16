@@ -885,6 +885,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     spec_query_len=self.num_spec + 1,
                 )
             else:
+                assert g_spec is not None
+                assert beta_spec is not None
                 query_spec = l2norm_fwd(query_spec)
                 key_spec = l2norm_fwd(key_spec)
                 if use_upstream_recurrent:

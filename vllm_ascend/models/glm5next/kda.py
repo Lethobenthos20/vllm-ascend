@@ -27,8 +27,8 @@ from vllm.models.kimi_k3.nvidia.ops.recoverssm import KDARecoverSSMRecords
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
-from vllm_ascend.attention.gdn_attn_builder import AscendGDNHostMetadataBackend
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.gdn_attn_builder import AscendGDNHostMetadataBackend
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,

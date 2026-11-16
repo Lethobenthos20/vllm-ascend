@@ -333,7 +333,6 @@ def _kda_recoverssm_verify_kernel(
             )
 
 
-
 @triton.jit
 def _accumulate_kda_commit_step(
     correction_cache_ptr,

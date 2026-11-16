@@ -534,9 +534,9 @@ def test_align_final_and_boundary_routes(
         plan.state_commit_lens[:3] + plan.boundary_commit_lens[:3], plan.commit_lens[:3], atol=0, rtol=0
     )
     assert not (plan.state_commit_lens[:3].bool() & plan.boundary_commit_lens[:3].bool()).any()
-    for layer_no, (layer, (state, conv, untouched)) in enumerate(zip(layers, expected_layers)):
+    for layer_no, (layer, (state, conv, untouched_indices)) in enumerate(zip(layers, expected_layers)):
         check_accuracy(layer.kv_cache[1], state, record_property, f"align_commit{layer_no}")
-        torch.testing.assert_close(layer.kv_cache[1][untouched], state[untouched], atol=0, rtol=0)
+        torch.testing.assert_close(layer.kv_cache[1][untouched_indices], state[untouched_indices], atol=0, rtol=0)
         torch.testing.assert_close(layer.kv_cache[0], conv, atol=0, rtol=0)
 
 

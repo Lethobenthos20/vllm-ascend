@@ -111,6 +111,8 @@ def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
 ) -> VllmConfig:
+    # Run before the Qwen4Exp MTP layers construct their rotary embeddings so
+    # graph capture cannot retain an undersized cache.
     _align_qwen4_exp_mtp_position_cache(vllm_config)
     draft_vllm_config = _upstream_make_draft_vllm_config(
         vllm_config,

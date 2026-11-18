@@ -2,7 +2,24 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from vllm_ascend.ops.triton.linearnorm.qsa_rope_utils import validate_qsa_rope_positions
+
+def _validate_rope_positions(
+    positions: torch.Tensor,
+    cache: torch.Tensor,
+    tensor: torch.Tensor,
+    rope_dim: int,
+) -> None:
+    """Check the direct-gather ABI using metadata only (safe during capture)."""
+    if positions.ndim not in (1, 2) or (positions.ndim == 2 and positions.shape[0] != 3):
+        raise ValueError("QSA positions must have one or three axes")
+    if positions.shape[-1] != tensor.shape[0] or positions.dtype not in (torch.int32, torch.int64):
+        raise ValueError("QSA positions must be integer positions for every token")
+    if cache.ndim != 2 or cache.shape[0] == 0 or cache.shape[1] != rope_dim or cache.stride(1) != 1:
+        raise ValueError("QSA rotary cache must have nonempty, contiguous rotary rows")
+    if tensor.dtype != torch.bfloat16 or cache.dtype != tensor.dtype:
+        raise ValueError("QSA direct rotary gathering requires a BF16 cache and input")
+    if positions.device != tensor.device or cache.device != tensor.device:
+        raise ValueError("QSA positions, rotary cache and input must share a device")
 
 
 @triton.jit
@@ -44,14 +61,11 @@ def _qsa_rmsnorm_mrope_kernel(
 
     half_rope_dim: tl.constexpr = rope_dim // 2
     rotary_offsets = tl.arange(0, half_rope_dim)
-    if has_mrope:
-        h_mask = (rotary_offsets % 3 == 1) & (rotary_offsets < mrope_section_h * 3)
-        w_mask = (rotary_offsets % 3 == 2) & (rotary_offsets < mrope_section_w * 3)
-        axis = tl.where(h_mask, 1, tl.where(w_mask, 2, 0))
-    else:
-        axis = tl.full((half_rope_dim,), 0, tl.int32)
     if GATHER_CACHE:
         if has_mrope:
+            h_mask = (rotary_offsets % 3 == 1) & (rotary_offsets < mrope_section_h * 3)
+            w_mask = (rotary_offsets % 3 == 2) & (rotary_offsets < mrope_section_w * 3)
+            axis = tl.where(h_mask, 1, tl.where(w_mask, 2, 0))
             position = tl.load(positions_ptr + axis * position_stride_axis + token_id * position_stride_token)
         else:
             # Keep the shared position scalar: an all-zero axis vector creates
@@ -59,11 +73,24 @@ def _qsa_rmsnorm_mrope_kernel(
             position = tl.load(positions_ptr + token_id * position_stride_token)
         position = tl.minimum(tl.maximum(position, 0), cache_rows - 1)
         cache_row = cos_sin_ptr + position.to(tl.int64) * cos_sin_stride_token
+        cos = tl.load(cache_row + rotary_offsets).to(tl.float32)
+        sin = tl.load(cache_row + rotary_offsets + half_rope_dim).to(tl.float32)
+    elif has_mrope:
+        h_mask = (rotary_offsets % 3 == 1) & (rotary_offsets < mrope_section_h * 3)
+        w_mask = (rotary_offsets % 3 == 2) & (rotary_offsets < mrope_section_w * 3)
+        cache_row = cos_sin_ptr + token_id * cos_sin_stride_token
+        cos_t = tl.load(cache_row + rotary_offsets).to(tl.float32)
+        cos_h = tl.load(cache_row + cos_sin_stride_axis + rotary_offsets).to(tl.float32)
+        cos_w = tl.load(cache_row + 2 * cos_sin_stride_axis + rotary_offsets).to(tl.float32)
+        sin_t = tl.load(cache_row + rotary_offsets + half_rope_dim).to(tl.float32)
+        sin_h = tl.load(cache_row + cos_sin_stride_axis + rotary_offsets + half_rope_dim).to(tl.float32)
+        sin_w = tl.load(cache_row + 2 * cos_sin_stride_axis + rotary_offsets + half_rope_dim).to(tl.float32)
+        cos = tl.where(h_mask, cos_h, tl.where(w_mask, cos_w, cos_t))
+        sin = tl.where(h_mask, sin_h, tl.where(w_mask, sin_w, sin_t))
     else:
-        cache_row = cos_sin_ptr + axis * cos_sin_stride_axis + token_id * cos_sin_stride_token
-
-    cos = tl.load(cache_row + rotary_offsets).to(tl.float32)
-    sin = tl.load(cache_row + rotary_offsets + half_rope_dim).to(tl.float32)
+        cache_row = cos_sin_ptr + token_id * cos_sin_stride_token
+        cos = tl.load(cache_row + rotary_offsets).to(tl.float32)
+        sin = tl.load(cache_row + rotary_offsets + half_rope_dim).to(tl.float32)
     first = tl.load(input_row + rotary_offsets).to(tl.float32)
     first_weight = tl.load(weight_ptr + rotary_offsets).to(tl.float32) + 1.0
     first = (first * reciprocal_std * first_weight).to(tl.bfloat16)
@@ -108,7 +135,7 @@ def triton_qsa_rmsnorm_mrope(
         raise ValueError("QSA norm+RoPE token and rotary rows must match")
 
     if positions is not None:
-        validate_qsa_rope_positions(positions, cos_sin, tensor, rope_dim)
+        _validate_rope_positions(positions, cos_sin, tensor, rope_dim)
     has_mrope = cos_sin.ndim == 3 if positions is None else positions.ndim == 2
     if has_mrope:
         if (positions is None and cos_sin.shape[0] != 3) or len(mrope_section) != 3:

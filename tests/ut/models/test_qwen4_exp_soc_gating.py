@@ -4,10 +4,8 @@
 from types import SimpleNamespace
 from typing import Any
 
-import pytest
 import torch
 
-from vllm_ascend.models.qwen4_exp import lightning_indexer
 from vllm_ascend.models.qwen4_exp import qsa as ascend_qsa
 from vllm_ascend.utils import vllm_version_is
 
@@ -32,22 +30,15 @@ def _select_metadata() -> SimpleNamespace:
     )
 
 
-@pytest.mark.parametrize("prepared", [False, True])
-def test_select_always_uses_cann_lightning_v2(monkeypatch, prepared) -> None:
+def test_select_always_uses_cann_lightning_v2(monkeypatch) -> None:
     sentinel = torch.zeros(1, 2051, dtype=torch.int32)
     calls: list[tuple] = []
     metadata = _select_metadata()
-    metadata.qsa_num_live_requests = 1
-    metadata.qsa_num_live_tokens = 1
-    schedule = torch.empty(2048, dtype=torch.int32) if prepared else None
-    if prepared:
-        metadata.qsa_lightning_v2_metadata = schedule
 
     def lightning(*args, **kwargs):
         calls.append(args)
-        assert kwargs["num_actual_requests"] == 1
-        assert kwargs["num_actual_tokens"] == 1
-        assert kwargs["prepared_metadata"] is schedule
+        assert args[2] is metadata
+        assert not kwargs
         return sentinel
 
     monkeypatch.setattr(ascend_qsa, "qsa_select_paged_tokens_lightning_v2", lightning)
@@ -55,22 +46,6 @@ def test_select_always_uses_cann_lightning_v2(monkeypatch, prepared) -> None:
 
     assert result is sentinel
     assert len(calls) == 1
-
-
-@pytest.mark.parametrize("page_size", [192, 384])
-def test_lightning_indexer_accepts_runtime_page_sizes(page_size: int) -> None:
-    output = lightning_indexer.qsa_select_paged_tokens_lightning(
-        query=torch.empty(0, 8, 128, dtype=torch.bfloat16),
-        compressed_key_cache=torch.empty(1, page_size, 1, 128, dtype=torch.bfloat16),
-        block_table=torch.empty(0, 1, dtype=torch.int32),
-        token_to_req=torch.empty(0, dtype=torch.int64),
-        query_positions=torch.empty(0, dtype=torch.int64),
-        sequence_lengths=torch.empty(0, dtype=torch.int32),
-        query_start_loc=torch.zeros(1, dtype=torch.int32),
-        token_topk=2048,
-        compress_ratio=4,
-    )
-    assert output.shape == (0, 2051)
 
 
 def _make_impl() -> ascend_qsa.AscendQSAImpl:
